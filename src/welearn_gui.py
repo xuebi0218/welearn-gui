@@ -1045,7 +1045,11 @@ class WelearnApp:
         sep.pack(fill="x", padx=60, pady=(0, 20))
 
         try:
-            qr_img = ctk.CTkImage(Image.open(_DONATE_QR_PATH), size=(280, 280))
+            pil_qr = Image.open(_DONATE_QR_PATH)
+            qw = 300
+            qh = int(pil_qr.size[1] * (qw / pil_qr.size[0]))
+            pil_qr = pil_qr.resize((qw, qh), Image.LANCZOS)
+            qr_img = ctk.CTkImage(pil_qr, size=(qw, qh))
             ctk.CTkLabel(container, image=qr_img, text="").pack(pady=(0, 10))
         except Exception:
             ctk.CTkLabel(container, text="(赞赏码图片未找到)",
@@ -1083,20 +1087,27 @@ class WelearnApp:
                         justify="left").pack(anchor="w", pady=4, padx=10)
 
         # 教程图片
-        for i, img_name in enumerate([("help_1.jpg", "步骤 1-2: 打开控制台和网络标签"),
-                                       ("help_2.jpg", "步骤 3-4: 刷新并找到第一个请求"),
-                                       ("help_3.jpg", "步骤 5-6: 找到并复制 Cookie")]):
+        img_infos = [
+            ("help_1.jpg", "步骤 1-2: 打开控制台和网络标签"),
+            ("help_2.jpg", "步骤 3-4: 刷新并找到第一个请求"),
+            ("help_3.jpg", "步骤 5-6: 找到并复制 Cookie"),
+        ]
+        for img_file, img_title in img_infos:
             try:
                 if getattr(sys, 'frozen', False):
-                    img_path = _os.path.join(sys._MEIPASS, 'src', img_name[0])
+                    img_path = _os.path.join(sys._MEIPASS, 'src', img_file)
                 else:
-                    img_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), img_name[0])
-                img = ctk.CTkImage(Image.open(img_path), size=(500, 280))
-                ctk.CTkLabel(scroll, text=img_name[1], font=ctk.CTkFont(size=13, weight="bold"),
+                    img_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), img_file)
+                pil_img = Image.open(img_path)
+                tw = 480
+                th = int(pil_img.size[1] * (tw / pil_img.size[0]))
+                pil_img = pil_img.resize((tw, th), Image.LANCZOS)
+                img = ctk.CTkImage(pil_img, size=(tw, th))
+                ctk.CTkLabel(scroll, text=img_title, font=ctk.CTkFont(size=13, weight="bold"),
                             text_color="#3498db").pack(anchor="w", padx=10, pady=(15, 5))
                 ctk.CTkLabel(scroll, image=img, text="").pack(pady=(0, 10))
             except Exception:
-                ctk.CTkLabel(scroll, text=f"(教程图片 {img_name[0]} 未找到)",
+                ctk.CTkLabel(scroll, text=f"(教程图片 {img_file} 未找到)",
                             font=ctk.CTkFont(size=12), text_color="gray").pack(pady=5)
 
         # 注意事项
@@ -1140,8 +1151,12 @@ class WelearnApp:
                      font=ctk.CTkFont(size=15, weight="bold")).pack(anchor="w", padx=20, pady=(10, 8))
         ctk.CTkLabel(container, text="当前版本: v3.1",
                      font=ctk.CTkFont(size=14), text_color="gray").pack(anchor="w", padx=20, pady=2)
-        ctk.CTkLabel(container, text="项目主页: (待设置)",
-                     font=ctk.CTkFont(size=14), text_color="gray").pack(anchor="w", padx=20, pady=2)
+        self.github_link = ctk.CTkButton(container, text="项目主页: github.com/xuebi0218/welearn-gui",
+                                          font=ctk.CTkFont(size=13), fg_color="transparent",
+                                          text_color="#3498db", hover_color=("gray80", "gray30"),
+                                          anchor="w", height=28, width=320,
+                                          command=self._on_open_github)
+        self.github_link.pack(anchor="w", padx=15, pady=2)
 
         # 检查更新
         self.btn_update = ctk.CTkButton(container, text="检查更新", width=150, height=35,
@@ -1350,11 +1365,15 @@ class WelearnApp:
         theme_map = {"跟随系统": "System", "浅色": "Light", "深色": "Dark"}
         ctk.set_appearance_mode(theme_map.get(choice, "System"))
 
+    def _on_open_github(self):
+        import webbrowser
+        webbrowser.open("https://github.com/xuebi0218/welearn-gui")
+
     def _on_check_update(self):
         self._log("检查更新中...")
         try:
             resp = requests.get(
-                "https://api.github.com/repos/welearn-tool/welearn-gui/releases/latest",
+                "https://api.github.com/repos/xuebi0218/welearn-gui/releases/latest",
                 timeout=10)
             if resp.status_code == 200:
                 latest = resp.json()["tag_name"]
