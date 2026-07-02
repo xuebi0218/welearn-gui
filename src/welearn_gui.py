@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Welearn 刷课工具 GUI v3.0
+Welearn 刷课工具 GUI v3.5
 整合刷课模式和刷时长模式，使用 CustomTkinter 构建界面。
+v3.2: 新增题目解析和答题记录提交功能。
+v3.3: 修复章节学习时长为0的bug，刷课模式支持多线程并发+真实学习时长。
+v3.4: 修复刷时长模式心跳未触发导致时长不增长的bug。
+v3.5: 修复最后一项卡住问题(join超时类型错误)、停止按钮即时响应(分段sleep+轮询join)、增强日志输出。
 """
 
 import re
@@ -14,6 +18,7 @@ import hashlib
 import base64
 import threading
 import secrets
+from html import unescape
 from urllib.parse import urlparse, parse_qs
 
 import requests
@@ -93,25 +98,51 @@ AJAX_STUDYSTAT_URL = "https://welearn.sflep.com/ajax/StudyStat.aspx"
 AJAX_AUTHCOURSE_URL = "https://welearn.sflep.com/ajax/authCourse.aspx"
 COURSE_INFO_URL = "https://welearn.sflep.com/student/course_info.aspx"
 
-# 赞赏码图片路径（打包后从 exe 内部读取，源码运行从同目录读取）
+# 图片资源路径（打包后从 exe 内部读取，源码运行从同目录读取）
 import os as _os
+_SRC_DIR = _os.path.dirname(_os.path.abspath(__file__))
 if getattr(sys, 'frozen', False):
     _DONATE_QR_PATH = _os.path.join(sys._MEIPASS, 'src', 'donate_qr.jpg')
+    _NOBI_PATH = _os.path.join(sys._MEIPASS, 'src', 'nobi.png')
 else:
-    _DONATE_QR_PATH = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'donate_qr.jpg')
+    _DONATE_QR_PATH = _os.path.join(_SRC_DIR, 'donate_qr.jpg')
+    _NOBI_PATH = _os.path.join(_SRC_DIR, 'nobi.png')
 
 
 # ── API 函数 ──────────────────────────────────────────
 def parse_cookie_string(cookie_str):
-    """解析浏览器复制格式的 Cookie 字符串为字典"""
+    """
+    解析 Cookie 字符串为字典。
+    支持两种格式:
+    1. 浏览器复制格式: name1=value1; name2=value2; ...
+    2. JSON 数组格式 (EditThisCookie/Chrome导出): [{"name":..., "value":...}, ...]
+    """
+    s = cookie_str.strip()
     cookie = {}
-    for item in cookie_str.split(";"):
+
+    # ── 格式1: JSON 数组 ──
+    if s.startswith('['):
+        try:
+            arr = json.loads(s)
+            for c in arr:
+                name = c.get('name', '')
+                value = c.get('value', '')
+                if name:
+                    cookie[name] = value
+            if cookie:
+                return cookie
+        except (json.JSONDecodeError, TypeError):
+            pass  # 不是合法 JSON，继续按旧格式解析
+
+    # ── 格式2: name=value; name=value ──
+    for item in s.split(";"):
         item = item.strip()
         if item and '=' in item:
             k, v = item.split('=', 1)
             cookie[k.strip()] = v.strip()
+
     if not cookie:
-        raise ValueError("空Cookie")
+        raise ValueError("空Cookie或格式不识别")
     return cookie
 
 
@@ -295,48 +326,104 @@ def welearn_get_lessons(session, cid, uid, unitidx, classid):
     return resp.json()['info']
 
 
-def welearn_curriculum_submit(session, cid, uid, classid, scoid, crate):
+def welearn_curriculum_submit(session, cid, uid, classid, scoid, crate, learntime=0, stop_check=None):
     """
-    刷课模式：提交一个小节的完成数据。
-    执行 startsco160928 → setscoinfo → savescoinfo160928
-    返回 (way1_success: bool, way2_success: bool, response_text: str)
+    刷课模式：提交一个小节的完成数据（v3.2: 带答题记录）。
+    执行 scoAddr → 解析题目 → startsco160928 → sleep(learntime) → setscoinfo → savescoinfo160928
+    learntime: 学习时长（秒），0 表示不等待（兼容旧行为）
+    stop_check: 可选回调，返回 True 表示用户请求停止，用于分段 sleep 中及时响应
+    返回 (way1_success: bool, way2_success: bool, questions_found: int)
     """
     referer = f"https://welearn.sflep.com/Student/StudyCourse.aspx?cid={cid}&classid={classid}&sco={scoid}"
 
-    # 第1步：开始 SCO
+    # ── 0. 尝试获取 SCO 模板并解析题目 ──
+    questions = []
+    try:
+        template_url, err = welearn_get_sco_addr(session, cid, scoid)
+        if template_url:
+            html = _fetch_sco_template(session, template_url)
+            if html:
+                questions = parse_sco_questions(html)
+    except Exception:
+        pass  # 解析失败不影响主流程，退化为空 interactions
+
+    crate_int = int(crate) if crate.isdigit() else 100
+
+    if questions:
+        interactions_json, interactions_info = generate_interactions(questions, crate_int)
+    else:
+        interactions_json, interactions_info = [], ''
+
+    # ── 构造提交数据 ──
+    data_obj = {
+        "cmi": {
+            "completion_status": "completed",
+            "interactions": interactions_json,
+            "launch_data": "",
+            "progress_measure": "1",
+            "score": {"scaled": str(crate_int), "raw": "100"},
+            "session_time": str(learntime),
+            "success_status": "unknown",
+            "total_time": str(learntime),
+            "mode": "normal"
+        },
+        "adl": {"data": []},
+        "cci": {
+            "data": [],
+            "service": {
+                "dictionary": {"headword": "", "short_cuts": ""},
+                "new_words": [],
+                "notes": [],
+                "writing_marking": [],
+                "record": {"files": []},
+                "play": {"offline_media_id": "9999"}
+            },
+            "retry_count": "0",
+            "submit_time": ""
+        }
+    }
+    data_str = json.dumps(data_obj, ensure_ascii=False)
+    full_data = data_str + '[INTERACTIONINFO]' + interactions_info
+
+    # ── 第1步：开始 SCO ──
     session.post(AJAX_SCO_URL,
                  data={"action": "startsco160928", "cid": cid, "scoid": scoid, "uid": uid},
                  headers=_build_headers(referer), timeout=15)
 
-    time.sleep(_rand_delay(0.2, 0.5))  # 随机微小延迟
+    # ★ 等待学习时长，让服务端计时（v3.3: 修复章节时长为0的问题）
+    # v3.5: 分段 sleep，每5秒检查停止请求，避免长时间无法响应
+    if learntime > 0:
+        chunk = 5  # 每5秒检查一次停止标志
+        slept = 0
+        while slept < learntime:
+            if stop_check and stop_check():
+                return False, False, len(questions)  # 用户停止，提前退出
+            wait = min(chunk, learntime - slept)
+            time.sleep(wait)
+            slept += wait
+    else:
+        time.sleep(_rand_delay(0.2, 0.5))
 
-    # 第2步：提交 SCORM 数据
-    data = ('{"cmi":{"completion_status":"completed","interactions":[],"launch_data":"",'
-            '"progress_measure":"1","score":{"scaled":"' + crate + '","raw":"100"},'
-            '"session_time":"0","success_status":"unknown","total_time":"0","mode":"normal"},'
-            '"adl":{"data":[]},'
-            '"cci":{"data":[],"service":{"dictionary":{"headword":"","short_cuts":""},'
-            '"new_words":[],"notes":[],"writing_marking":[],"record":{"files":[]},'
-            '"play":{"offline_media_id":"9999"}},"retry_count":"0","submit_time":""}}'
-            '[INTERACTIONINFO]')
-
+    # ── 第2步：提交 SCORM 数据（含 interactions） ──
     resp1 = session.post(AJAX_SCO_URL,
                          data={"action": "setscoinfo", "cid": cid, "scoid": scoid,
-                               "uid": uid, "data": data, "isend": "False"},
+                               "uid": uid, "data": full_data, "isend": "False"},
                          headers=_build_headers(referer), timeout=15)
     way1_ok = '"ret":0' in resp1.text
 
-    time.sleep(_rand_delay(0.3, 0.4))  # 模拟人工操作间隔
+    time.sleep(_rand_delay(0.3, 0.4))
 
-    # 第3步：保存进度
+    # ── 第3步：保存进度 ──
     resp2 = session.post(AJAX_SCO_URL,
                          data={"action": "savescoinfo160928", "cid": cid, "scoid": scoid,
-                               "uid": uid, "progress": "100", "crate": crate,
-                               "status": "unknown", "cstatus": "completed", "trycount": "0"},
+                               "uid": uid, "progress": "100", "crate": str(crate_int),
+                               "status": "unknown", "cstatus": "completed", "trycount": "0",
+                               "session_time": str(learntime),
+                               "total_time": str(learntime)},
                          headers=_build_headers(referer), timeout=15)
     way2_ok = '"ret":0' in resp2.text
 
-    return way1_ok, way2_ok
+    return way1_ok, way2_ok, len(questions)
 
 
 def welearn_time_init(session, cid, uid, scoid):
@@ -385,15 +472,153 @@ def welearn_time_heartbeat(session, cid, uid, scoid, session_time, total_time):
     return '"ret":0' in resp.text
 
 
-def welearn_time_finalize(session, cid, uid, scoid, progress, crate, cstatus):
-    """刷时长模式：保存最终学习数据"""
+def welearn_time_finalize(session, cid, uid, scoid, progress, crate, cstatus,
+                          session_time, total_time):
+    """刷时长模式：保存最终学习数据（含累加后的学习时间）"""
     resp = session.post(AJAX_SCO_URL,
                         data={'action': 'savescoinfo160928', 'cid': cid, 'scoid': scoid,
                               'uid': uid, 'progress': progress, 'crate': crate,
-                              'status': 'unknown', 'cstatus': cstatus, 'trycount': '0'},
+                              'status': 'unknown', 'cstatus': cstatus, 'trycount': '0',
+                              'session_time': session_time, 'total_time': total_time},
                         headers=_build_headers('https://welearn.sflep.com/student/StudyCourse.aspx'),
                         timeout=15)
     return '"ret":0' in resp.text
+
+
+# ── 题目解析 & Interactions 生成 ─────────────────────
+
+def _js_escape(s):
+    """模拟 JavaScript 的 escape() 函数（用于 interactionsInfo 编码）"""
+    result = []
+    for ch in s:
+        code = ord(ch)
+        if (48 <= code <= 57) or (65 <= code <= 90) or (97 <= code <= 122) or \
+           ch in '@*-_+./':
+            result.append(ch)
+        elif code < 256:
+            result.append(f'%{code:02X}')
+        else:
+            result.append(f'%u{code:04X}')
+    return ''.join(result)
+
+
+def welearn_get_sco_addr(session, cid, scoid):
+    """
+    获取 SCO 内容的模板 URL。
+    返回 (template_url: str|None, error: str|None)
+    """
+    try:
+        ref = f"https://welearn.sflep.com/Student/StudyCourse.aspx?cid={cid}&sco={scoid}"
+        resp = session.post(AJAX_SCO_URL,
+                            data={'action': 'scoAddr', 'cid': cid, 'scoid': scoid},
+                            headers=_build_headers(ref), timeout=15)
+        data = resp.json()
+        if data.get('ret') != 0 or 'addr' not in data:
+            return None, f"scoAddr 返回异常: {resp.text[:200]}"
+
+        addr_full = data['addr']
+        sco_url = 'https:' + addr_full.split('|')[0]
+
+        # 从 hash 路由解析 unit/file: #/2/4-3 → unit=2, file=4-3
+        match = re.search(r'#/(\d+)/([\d\-]+)', sco_url)
+        if not match:
+            return None, f"无法解析 SCO URL: {sco_url}"
+
+        unit = int(match.group(1))
+        file = match.group(2)
+        base_path = sco_url.split('#')[0].rsplit('/', 1)[0]
+        template_url = f"{base_path}/data/{unit}/{file}.html"
+        return template_url, None
+    except Exception as e:
+        return None, str(e)
+
+
+def _fetch_sco_template(session, template_url):
+    """抓取 SCO HTML 模板（使用已认证 session）"""
+    try:
+        resp = session.get(template_url,
+                           headers=_build_headers(),
+                           timeout=15)
+        if resp.status_code != 200:
+            return None
+        return resp.text
+    except Exception:
+        return None
+
+
+def parse_sco_questions(html):
+    """
+    从 SCO HTML 模板解析题目和正确答案。
+    支持题型: <et-blank g> (填空), <et-tof key> (判断), <et-choice key> (选择)
+    返回 list[dict]: 每道题 {type, answer, text?}
+    """
+    questions = []
+
+    # ── 填空: <et-blank g>答案</et-blank> ──
+    for m in re.finditer(r'<et-blank\s+g>(.*?)</et-blank>', html, re.DOTALL):
+        answer = m.group(1).strip()
+        answer = re.sub(r'<[^>]+>', '', answer)
+        answer = unescape(answer).strip()
+        if answer:
+            questions.append({'type': 'blank', 'answer': answer})
+
+    # ── 判断: <et-tof key="t|f"> ──
+    for m in re.finditer(r'<et-tof\s+key="([tf])"', html, re.DOTALL):
+        questions.append({'type': 'tof', 'answer': m.group(1)})
+
+    # ── 选择: <et-choice key="..."> ──
+    for m in re.finditer(r'<et-choice[^>]*key="([^"]*)"', html, re.DOTALL):
+        questions.append({'type': 'choice', 'answer': m.group(1)})
+
+    return questions
+
+
+def generate_interactions(questions, crate):
+    """
+    根据题目列表和正确率生成:
+    - interactions_json: SCORM cmi.interactions 数组
+    - interactions_info: [INTERACTIONINFO] 后面的字符串
+    """
+    interactions_json = []
+    interactions_info_parts = []
+
+    for i, q in enumerate(questions):
+        is_correct = random.random() * 100 < crate
+
+        if q['type'] == 'blank':
+            learner_response = q['answer'] if is_correct else 'wrong_answer_' + str(i)
+            result = 'correct' if is_correct else 'wrong'
+        elif q['type'] == 'tof':
+            learner_response = q['answer'] if is_correct else ('f' if q['answer'] == 't' else 't')
+            result = 'correct' if is_correct else 'wrong'
+        elif q['type'] == 'choice':
+            learner_response = q['answer'] if is_correct else (
+                'B' if q['answer'] == 'A' else 'A')
+            result = 'correct' if is_correct else 'wrong'
+        else:
+            continue
+
+        # SCORM interactions 对象
+        scorm_obj = {
+            'id': f'interaction_{i}',
+            'type': q['type'],
+            'student_response': learner_response,
+            'result': result,
+            'weighting': '1',
+        }
+        if is_correct:
+            scorm_obj['correct_responses'] = [{'pattern': q['answer']}]
+        interactions_json.append(scorm_obj)
+
+        # interactionsInfo 单项
+        interactions_info_parts.append(
+            f'{i}[]false[]false[]'
+            f'{_js_escape(learner_response)}[]'
+            f'{result}'
+        )
+
+    interactions_info = '$$'.join(interactions_info_parts)
+    return interactions_json, interactions_info
 
 
 # ── 工作线程 ──────────────────────────────────────────
@@ -442,25 +667,27 @@ def thread_fetch_units(app, cid):
 
 
 def thread_curriculum_execute(app):
-    """后台线程：执行刷课模式"""
+    """后台线程：执行刷课模式（v3.3: 多线程并发 + 真实学习时长）"""
     cid = app.selected_cid
     uid = app.uid
     classid = app.classid
     unitidx = app.selected_unit_idx
     mycrate = app.curriculum_rate
     randommode = app.curriculum_random
+    duration = app.curriculum_duration
+    random_duration = isinstance(duration, list)
+    max_threads = max(1, app.curriculum_max_threads)
 
+    stats_lock = threading.Lock()
     way1_ok = way1_fail = way2_ok = way2_fail = 0
-    total_lessons = 0
-    completed_lessons = 0
 
     if unitidx == 0:
-        unit_start, unit_end = 0, 999  # 靠 API 返回异常终止
+        unit_start, unit_end = 0, 999
     else:
         unit_start = unitidx - 1
         unit_end = unitidx
 
-    # 第一遍：统计总数
+    # 统计总数
     all_lessons = []
     for i in range(unit_start, unit_end):
         if app.stop_requested:
@@ -472,40 +699,126 @@ def thread_curriculum_execute(app):
             if c['isvisible'] != 'false' and "未" in c.get('iscomplete', ''):
                 all_lessons.append((i, c))
 
-    app.message_queue.put({"type": "progress", "current": 0, "total": len(all_lessons)})
+    total = len(all_lessons)
+    app.message_queue.put({"type": "progress", "current": 0, "total": total})
+    dur_label = f"{duration[0]}~{duration[1]}s" if random_duration else f"{duration}s"
+    app.message_queue.put({"type": "log_warning", "text": f"📝 刷课任务启动 | 共 {total} 个小节待完成 | 时长={dur_label} | 线程={max_threads}"})
+    app.message_queue.put({"type": "log_warning", "text": "📌 请耐心等待，不要关闭窗口！"})
 
-    # 第二遍：逐课完成
-    processed = 0
-    for unit_i, course in all_lessons:
+    if total == 0:
+        app.message_queue.put({"type": "log", "text": "没有需要完成的小节。"})
+        app.message_queue.put({"type": "curriculum_complete",
+                               "way1_ok": 0, "way1_fail": 0,
+                               "way2_ok": 0, "way2_fail": 0,
+                               "stopped": False})
+        return
+
+    processed = [0]  # 用 list 包装以在闭包中可修改
+
+    # 分批多线程处理
+    for batch_start in range(0, total, max_threads):
         if app.stop_requested:
-            app.message_queue.put({"type": "log", "text": "用户停止了操作。"})
+            app.message_queue.put({"type": "log_warning", "text": "⚠️ 用户停止了任务"})
             break
 
-        if randommode:
-            crate = str(random.randint(mycrate[0], mycrate[1]))
-        else:
-            crate = str(mycrate)
+        batch = all_lessons[batch_start:batch_start + max_threads]
+        threads_list = []
 
-        app.message_queue.put({"type": "log", "text": f'[即将完成]    {course["location"]}'})
+        def process_one(unit_i, course):
+            nonlocal way1_ok, way1_fail, way2_ok, way2_fail
+            if app.stop_requested:
+                return
+            loc = course["location"]
+            scoid = course["id"]
 
-        w1, w2 = welearn_curriculum_submit(app.session, cid, uid, classid, course["id"], crate)
+            try:
+                if randommode:
+                    crate = str(random.randint(mycrate[0], mycrate[1]))
+                else:
+                    crate = str(mycrate)
 
-        if w1:
-            way1_ok += 1
-        else:
-            way1_fail += 1
-        if w2:
-            way2_ok += 1
-        else:
-            way2_fail += 1
+                if random_duration:
+                    dur = random.randint(duration[0], duration[1])
+                else:
+                    dur = duration
 
-        status = f'正确率:{crate:>3}%  方式1:{"成功" if w1 else "失败"}  方式2:{"成功" if w2 else "失败"}'
-        tag = "log_success" if (w1 and w2) else "log_error"
-        app.message_queue.put({"type": tag, "text": status})
+                app.message_queue.put({"type": "log", "text": f'[刷课] {loc} → 正确率{crate}% 时长{dur}s 开始...'})
 
-        processed += 1
-        app.message_queue.put({"type": "progress", "current": processed, "total": len(all_lessons)})
-        time.sleep(_rand_delay(0.8, 0.5))  # 随机间隔，模拟人工
+                w1, w2, q_count = welearn_curriculum_submit(
+                    app.session, cid, uid, classid, scoid, crate, learntime=dur,
+                    stop_check=lambda: app.stop_requested)
+
+                if not w1 and not w2:
+                    app.message_queue.put({"type": "log_warning", "text": f'  [停止] {loc} - 用户中断'})
+
+                if q_count > 0:
+                    app.message_queue.put({"type": "log", "text": f'  解析到 {q_count} 道题，已生成答题记录'})
+
+                with stats_lock:
+                    if w1:
+                        way1_ok += 1
+                    else:
+                        way1_fail += 1
+                    if w2:
+                        way2_ok += 1
+                    else:
+                        way2_fail += 1
+
+                status = f'正确率:{crate:>3}%  方式1:{"成功" if w1 else "失败"}  方式2:{"成功" if w2 else "失败"}'
+                tag = "log_success" if (w1 and w2) else "log_error"
+                app.message_queue.put({"type": tag, "text": status})
+
+                processed[0] += 1
+                app.message_queue.put({"type": "progress", "current": processed[0], "total": total})
+            except Exception as e:
+                app.message_queue.put({"type": "log_error", "text": f'  ✗ [异常] {loc} - {e}'})
+                with stats_lock:
+                    way1_fail += 1
+                    way2_fail += 1
+
+        # 计算本批次最长时长（用于 join 超时和日志）
+        batch_durs = []
+        for unit_i, course in batch:
+            if random_duration:
+                batch_durs.append(random.randint(duration[0], duration[1]))
+            else:
+                batch_durs.append(duration)
+        batch_max_dur = max(batch_durs)
+
+        batch_num = batch_start // max_threads + 1
+        total_batches = (total + max_threads - 1) // max_threads
+        app.message_queue.put({"type": "log", "text": f'━━━ 批次 {batch_num}/{total_batches} | {len(batch)}个任务 | 最长{batch_max_dur}s ━━━'})
+
+        for idx, (unit_i, course) in enumerate(batch):
+            t = threading.Thread(target=process_one, args=(unit_i, course))
+            t.daemon = True
+            t.start()
+            threads_list.append((t, course, batch_durs[idx]))
+            time.sleep(_rand_delay(0.1, 0.5))  # 线程启动错开
+
+        # v3.5: 轮询等待，每1秒检查停止标志，可即时响应
+        batch_deadline = time.time() + batch_max_dur + 30
+        for t, course, dur in threads_list:
+            loc = course["location"]
+            while t.is_alive():
+                if app.stop_requested:
+                    app.message_queue.put({"type": "log_warning", "text": f'  ⏹ 停止请求：等待 {loc} 线程结束...'})
+                remaining = batch_deadline - time.time()
+                if remaining <= 0:
+                    app.message_queue.put({"type": "log_warning", "text": f'  ⚠ {loc} 超时（>{batch_max_dur+30}s），跳过等待'})
+                    break
+                t.join(timeout=min(1.0, remaining))
+            else:
+                continue  # 线程正常结束
+            # 超时：线程仍在运行，跳过
+            if t.is_alive():
+                app.message_queue.put({"type": "log_error", "text": f'  ✗ {loc} 未在预期时间内完成，已跳过'})
+
+        # 批次完成统计
+        remaining = total - processed[0]
+        est_sec = remaining * batch_max_dur // max(max_threads, 1) if remaining > 0 else 0
+        app.message_queue.put({"type": "log", "text": f'✅ 批次 {batch_num}/{total_batches} 完成 | 进度 {processed[0]}/{total} | 剩余 {remaining} 个 | 预计还需约 {est_sec} 秒'})
+        time.sleep(_rand_delay(0.3, 0.5))  # 批次间短暂间隔
 
     app.message_queue.put({"type": "curriculum_complete",
                            "way1_ok": way1_ok, "way1_fail": way1_fail,
@@ -532,8 +845,9 @@ def thread_time_execute(app):
     errors = []
     processed_lessons = 0
 
-    # 第一遍：统计总数
+    # 第一遍：统计总数（含已完成/未完成统计）
     all_lessons = []
+    already_done = 0
     for i in range(unit_start, unit_end):
         if app.stop_requested:
             break
@@ -543,13 +857,19 @@ def thread_time_execute(app):
         for c in lessons:
             if c.get('isvisible', 'true') != 'false':
                 all_lessons.append((i, c))
-        time.sleep(_rand_delay(0.3, 0.5))  # 获取单元间随机间隔
+                if "已" in c.get('iscomplete', '') and "未" not in c.get('iscomplete', ''):
+                    already_done += 1
 
-    app.message_queue.put({"type": "progress", "current": 0, "total": len(all_lessons)})
+    total = len(all_lessons)
+    to_do = total - already_done
+    app.message_queue.put({"type": "progress", "current": 0, "total": total})
+    dur_str = f"{inputtime[0]}~{inputtime[1]}s" if mode == 2 else f"{inputtime}s"
+    app.message_queue.put({"type": "log_warning", "text": f"⏱ 刷时长任务启动 | 共 {total} 个课时 | 已完成 {already_done} | 待处理 {to_do}"})
+    app.message_queue.put({"type": "log_warning", "text": "📌 请耐心等待，不要关闭窗口！每个课时需要 60~120 秒"})
 
     for lesson_idx in range(0, len(all_lessons), max_threads):
         if app.stop_requested:
-            app.message_queue.put({"type": "log", "text": "用户停止了操作。"})
+            app.message_queue.put({"type": "log_warning", "text": f"⚠️ 用户停止了任务 | 已处理 {processed_lessons}/{total} | 剩余 {total - processed_lessons} 个未处理"})
             break
 
         batch = all_lessons[lesson_idx:lesson_idx + max_threads]
@@ -567,47 +887,93 @@ def thread_time_execute(app):
                 return
             loc = course["location"]
             scoid = course["id"]
-            app.message_queue.put({"type": "log", "text": f'[刷时长] {loc} → +{learntime}秒'})
+            app.message_queue.put({"type": "log", "text": f'[刷时长] {loc} → +{learntime}秒 开始...'})
 
-            cmi = welearn_time_init(app.session, cid, uid, scoid)
-            if cmi is None:
-                app.message_queue.put({"type": "log_error", "text": f'  [失败] {loc} - 初始化学习数据失败'})
-                errors.append(loc)
-                return
-
-            # 随机化心跳间隔（55~65秒），避免固定60秒被检测
-            next_heartbeat = random.randint(55, 65)
-            for t in range(learntime):
-                if app.stop_requested:
+            try:
+                cmi = welearn_time_init(app.session, cid, uid, scoid)
+                if cmi is None:
+                    app.message_queue.put({"type": "log_error", "text": f'  [失败] {loc} - 初始化学习数据失败'})
+                    errors.append(loc)
                     return
-                time.sleep(_rand_delay(1.0, 0.15))  # 1秒 ± 15% 抖动
-                if t == next_heartbeat:
-                    welearn_time_heartbeat(app.session, cid, uid, scoid,
-                                           cmi['session_time'], cmi['total_time'])
-                    next_heartbeat = t + random.randint(55, 65)
 
-            ok = welearn_time_finalize(app.session, cid, uid, scoid,
-                                       cmi['progress'], cmi['crate'], cmi['cstatus'])
-            if ok:
-                app.message_queue.put({"type": "log_success", "text": f'  [完成] {loc}'})
-            else:
-                app.message_queue.put({"type": "log_error", "text": f'  [失败] {loc} - 保存失败'})
+                # 解析历史累计时间（秒），用于累加
+                try:
+                    init_total = int(cmi['total_time'])
+                except (ValueError, TypeError):
+                    init_total = 0
+
+                # 1. 初始心跳：注册会话开始，让服务端开始计时（对齐旧版行为）
+                welearn_time_heartbeat(app.session, cid, uid, scoid,
+                                       "0", str(init_total))
+
+                # 2. 随机化心跳间隔（30~40秒），缩短间隔确保短课时也能触发心跳
+                next_heartbeat = random.randint(30, 40)
+                elapsed = 0
+                heartbeat_count = 0
+                for t in range(learntime):
+                    if app.stop_requested:
+                        app.message_queue.put({"type": "log_warning", "text": f'  [停止] {loc} - 用户中断于 {t}s/{learntime}s'})
+                        return
+                    time.sleep(_rand_delay(1.0, 0.15))  # 1秒 ± 15% 抖动
+                    elapsed = t + 1  # 本次会话已过时间（秒）
+                    if elapsed >= next_heartbeat:
+                        welearn_time_heartbeat(app.session, cid, uid, scoid,
+                                               str(elapsed),
+                                               str(init_total + elapsed))
+                        heartbeat_count += 1
+                        next_heartbeat = elapsed + random.randint(30, 40)
+
+                # 3. 结束前最后一次心跳：告知服务端最终时间
+                welearn_time_heartbeat(app.session, cid, uid, scoid,
+                                       str(elapsed), str(init_total + elapsed))
+                heartbeat_count += 1
+
+                ok = welearn_time_finalize(app.session, cid, uid, scoid,
+                                           cmi['progress'], cmi['crate'], cmi['cstatus'],
+                                           str(elapsed), str(init_total + elapsed))
+                if ok:
+                    app.message_queue.put({"type": "log_success", "text": f'  [完成] {loc} (+{elapsed}s, {heartbeat_count}次心跳, 累计{init_total+elapsed}s)'})
+                else:
+                    app.message_queue.put({"type": "log_error", "text": f'  [失败] {loc} - 保存失败 (+{elapsed}s)'})
+                    errors.append(loc)
+            except Exception as e:
+                app.message_queue.put({"type": "log_error", "text": f'  [异常] {loc} - {e}'})
                 errors.append(loc)
 
         # 启动本批次所有线程（错开启动，避免瞬时并发高峰）
+        batch_num = lesson_idx // max_threads + 1
+        total_batches = (len(all_lessons) + max_threads - 1) // max_threads
+        app.message_queue.put({"type": "log", "text": f'━━━ 批次 {batch_num}/{total_batches} | {len(batch)}个课时 | 最长{max_duration}s ━━━'})
+
         for idx, (unit_i, course) in enumerate(batch):
             t = threading.Thread(target=process_one, args=(unit_i, course, durations[idx]))
             t.daemon = True
             t.start()
-            threads_list.append(t)
+            threads_list.append((t, course))
             time.sleep(_rand_delay(0.1, 0.5))  # 线程启动错开
 
-        # 等待本批次完成
-        for t in threads_list:
-            t.join(timeout=max_duration + 10)
+        # v3.5: 轮询等待，每1秒检查停止标志
+        batch_deadline = time.time() + max_duration + 10
+        for t, course in threads_list:
+            loc = course["location"]
+            while t.is_alive():
+                if app.stop_requested:
+                    app.message_queue.put({"type": "log_warning", "text": f'  ⏹ 停止请求：等待 {loc} 线程结束...'})
+                remaining = batch_deadline - time.time()
+                if remaining <= 0:
+                    app.message_queue.put({"type": "log_warning", "text": f'  ⚠ {loc} 超时（>{max_duration+10}s），跳过等待'})
+                    break
+                t.join(timeout=min(1.0, remaining))
+            else:
+                continue  # 线程正常结束
+            if t.is_alive():
+                app.message_queue.put({"type": "log_error", "text": f'  ✗ {loc} 未在预期时间内完成，已跳过'})
 
         processed_lessons += len(batch)
+        remaining = len(all_lessons) - processed_lessons
+        est_sec = remaining * (sum(durations) // len(durations)) // max_threads
         app.message_queue.put({"type": "progress", "current": processed_lessons, "total": len(all_lessons)})
+        app.message_queue.put({"type": "log", "text": f"✅ 批次完成 | 进度 {processed_lessons}/{len(all_lessons)} | 剩余 {remaining} 个 | 预计还需约 {est_sec} 秒"})
         time.sleep(_rand_delay(0.5, 0.6))  # 批次间随机间隔
 
     app.message_queue.put({"type": "time_complete", "errors": len(errors), "stopped": app.stop_requested})
@@ -616,7 +982,7 @@ def thread_time_execute(app):
 # ── 国际化文本 ────────────────────────────────────────
 T = {
     "zh": {
-        "app_title": "Welearn 刷课工具 v3.1",
+        "app_title": "Welearn 刷课工具 v3.5",
         "nav_home": "主页",
         "nav_donate": "赞助",
         "nav_help": "帮助",
@@ -636,7 +1002,7 @@ T = {
         "settings_theme_light": "浅色",
         "settings_theme_dark": "深色",
         "settings_about": "关于",
-        "settings_version": "当前版本",
+        "settings_version": "当前版本: v3.5",
         "settings_github": "项目主页",
         "settings_update": "检查更新",
         "settings_update_none": "已是最新版本",
@@ -680,7 +1046,7 @@ T = {
         "disclaimer_body": "本软件完全免费，仅供学习交流使用。\n\n1. 严禁任何形式的倒卖、商用行为\n2. 如您通过付费渠道获得本软件，请立即退款并举报\n3. 请合理使用本工具，由此产生的一切后果\n    由使用者自行承担\n4. 本软件开源，欢迎监督和贡献",
     },
     "en": {
-        "app_title": "Welearn Tool v3.1",
+        "app_title": "Welearn Tool v3.5",
         "nav_home": "Home",
         "nav_donate": "Donate",
         "nav_help": "Help",
@@ -700,7 +1066,7 @@ T = {
         "settings_theme_light": "Light",
         "settings_theme_dark": "Dark",
         "settings_about": "About",
-        "settings_version": "Version",
+        "settings_version": "Version: v3.5",
         "settings_github": "GitHub",
         "settings_update": "Check Update",
         "settings_update_none": "Already up to date",
@@ -747,19 +1113,46 @@ T = {
 _ = lambda app, key: T.get(app.lang, T["zh"]).get(key, key)
 
 
+# ── 配置持久化 ──────────────────────────────────────
+CONFIG_PATH = _os.path.join(_os.path.expanduser("~"), ".welearn_config.json")
+
+def _load_config():
+    """加载持久化配置"""
+    try:
+        if _os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def _save_config(cfg):
+    """保存持久化配置"""
+    try:
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
 # ── GUI 主类 ──────────────────────────────────────────
 class WelearnApp:
     def __init__(self):
-        ctk.set_appearance_mode("System")
+        # 加载持久化配置
+        self._config = _load_config()
+
+        # 外观模式（从配置恢复，默认跟随系统）
+        appearance = self._config.get("appearance", "System")
+        ctk.set_appearance_mode(appearance)
         ctk.set_default_color_theme("blue")
 
         self.root = ctk.CTk()
-        self.root.title("Welearn 刷课工具 v3.1")
-        self.root.geometry("1060x720")
+        self.root.title("Welearn 刷课工具 v3.5")
+        self.root.geometry("1120x720")
         self.root.minsize(960, 640)
 
-        # 语言
-        self.lang = "zh"
+        # 语言（从配置恢复）
+        self.lang = self._config.get("lang", "zh")
 
         # 应用状态
         self.session = requests.Session()
@@ -784,49 +1177,101 @@ class WelearnApp:
         # 刷课参数
         self.curriculum_rate = 100
         self.curriculum_random = False
+        self.curriculum_duration = [60, 120]
+        self.curriculum_max_threads = 10
 
         # 刷时长参数
-        self.time_duration = 30
-        self.time_mode = 1
-        self.time_max_threads = 100
+        self.time_duration = [60, 120]
+        self.time_mode = 2
+        self.time_max_threads = 10
 
         self._build_sidebar()
         self._build_content()
         self._build_statusbar()
         self._show_page("home")
         self.root.after(100, self._poll_queue)
-        self.root.after(300, self._show_disclaimer)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # 免责声明（从配置检查是否跳过）
+        if not self._config.get("disclaimer_skip", False):
+            self.root.after(300, self._show_disclaimer)
+
+    def _save_prefs(self):
+        """保存当前偏好到配置文件"""
+        self._config["lang"] = self.lang
+        self._config["appearance"] = ctk.get_appearance_mode()
+        _save_config(self._config)
 
     # ═══ 侧边栏 ═══════════════════════════════════════
     def _build_sidebar(self):
-        self.sidebar = ctk.CTkFrame(self.root, width=170, corner_radius=0)
+        self.sidebar = ctk.CTkFrame(self.root, width=300, corner_radius=0,
+                                     fg_color=("#1a1a2e", "#0d1117"))
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
 
-        # Logo / 标题
-        ctk.CTkLabel(self.sidebar, text="Welearn Tool",
-                     font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(25, 30))
+        # ── IP 吉祥物 ──
+        mascot_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        mascot_frame.pack(fill="x", padx=20, pady=(18, 2))
+        try:
+            nobi_img = ctk.CTkImage(Image.open(_NOBI_PATH), size=(54, 54))
+            ctk.CTkLabel(mascot_frame, image=nobi_img, text="").pack(anchor="center")
+        except Exception:
+            ctk.CTkLabel(mascot_frame, text="🐰", font=ctk.CTkFont(size=32)).pack(anchor="center")
+        ctk.CTkLabel(mascot_frame, text="Welearn",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=("#e2e8f0", "#e2e8f0")).pack(anchor="center", pady=(4, 0))
+        ctk.CTkLabel(mascot_frame, text="刷课工具",
+                     font=ctk.CTkFont(size=9),
+                     text_color=("#f0abfc", "#c084fc")).pack(anchor="center", pady=(1, 0))
 
-        # 导航按钮
+        # 分隔线 + 导航按钮区
+        nav_header = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        nav_header.pack(fill="x", padx=12, pady=(10, 5))
+        ctk.CTkFrame(nav_header, height=1, fg_color=("#30363d", "#21262d")).pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(nav_header, text="导航", font=ctk.CTkFont(size=10),
+                     text_color=("#484f58", "#484f58")).pack(anchor="w")
+
         nav_items = [
-            ("home", "主页"),
-            ("donate", "赞助"),
-            ("help", "帮助"),
-            ("settings", "设置"),
+            ("home", "🏠  主页"),
+            ("donate", "☕  赞助"),
+            ("help", "📖  帮助"),
+            ("settings", "⚙️  设置"),
         ]
         self.nav_buttons = {}
         for key, label in nav_items:
-            btn = ctk.CTkButton(self.sidebar, text=label, width=130, height=38,
-                               fg_color="transparent", text_color=("gray10", "gray90"),
-                               hover_color=("gray70", "gray30"),
-                               font=ctk.CTkFont(size=14),
+            btn = ctk.CTkButton(self.sidebar, text=label, width=270, height=36,
+                               corner_radius=8,
+                               fg_color="transparent",
+                               text_color=("#8b949e", "#8b949e"),
+                               hover_color=("#30363d", "#21262d"),
+                               font=ctk.CTkFont(size=12),
+                               anchor="w",
                                command=lambda k=key: self._show_page(k))
-            btn.pack(pady=3)
+            btn.pack(pady=1, padx=15)
             self.nav_buttons[key] = btn
 
-        # 底部版本号
-        ctk.CTkLabel(self.sidebar, text="v3.1",
-                     font=ctk.CTkFont(size=11), text_color="gray").pack(side="bottom", pady=15)
+        # ── 日志区（填满剩余侧边栏空间） ──
+        log_header = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        log_header.pack(fill="x", padx=15, pady=(10, 0))
+        ctk.CTkFrame(log_header, height=1, fg_color=("#30363d", "#21262d")).pack(fill="x", pady=(0, 6))
+        ctk.CTkLabel(log_header, text="📋 运行日志",
+                     font=ctk.CTkFont(size=12, weight="bold"),
+                     text_color=("#8b949e", "#8b949e")).pack(anchor="w")
+
+        self.log_text = ctk.CTkTextbox(self.sidebar, wrap="word",
+                                        font=ctk.CTkFont(size=11),
+                                        fg_color=("#0d1117", "#0d1117"))
+        self.log_text.pack(fill="both", expand=True, padx=10, pady=(4, 0))
+        self.log_text.configure(state="disabled")
+        self._setup_log_tags()
+
+        # 底部：状态 + 版本（紧凑一行）
+        bottom_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        bottom_frame.pack(side="bottom", fill="x", padx=15, pady=(4, 10))
+        ctk.CTkFrame(bottom_frame, height=1, fg_color=("#30363d", "#21262d")).pack(fill="x", pady=(0, 6))
+        ctk.CTkLabel(bottom_frame, text="v3.5 · 免费开源",
+                     font=ctk.CTkFont(size=9),
+                     text_color=("#484f58", "#484f58")).pack(anchor="w")
 
     # ═══ 内容区 ═══════════════════════════════════════
     def _build_content(self):
@@ -846,21 +1291,30 @@ class WelearnApp:
 
         for key, btn in self.nav_buttons.items():
             if key == name:
-                btn.configure(fg_color=("gray75", "gray35"))
+                btn.configure(fg_color=("#30363d", "#21262d"),
+                              text_color=("#f0abfc", "#c084fc"))
             else:
-                btn.configure(fg_color="transparent")
+                btn.configure(fg_color="transparent",
+                              text_color=("#8b949e", "#8b949e"))
 
     # ═══ 主页 ═════════════════════════════════════════
     def _build_home_page(self):
         page = ctk.CTkFrame(self.content_area, fg_color="transparent")
         self.pages["home"] = page
 
-        # ── 登录面板 ──
-        self.login_frame = ctk.CTkFrame(page)
-        self.login_frame.pack(fill="x", padx=10, pady=(10, 5))
+        # 可滚动容器（解决内容溢出问题）
+        self.home_scroll = ctk.CTkScrollableFrame(page, fg_color="transparent")
+        self.home_scroll.pack(fill="both", expand=True)
 
-        ctk.CTkLabel(self.login_frame, text="登录方式",
-                     font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", padx=15, pady=(10, 5))
+        # ── 登录面板 ──
+        self.login_frame = ctk.CTkFrame(self.home_scroll, corner_radius=12,
+                                         fg_color=("#f8fafc", "#1e293b"),
+                                         border_width=1,
+                                         border_color=("#e2e8f0", "#334155"))
+        self.login_frame.pack(fill="x", padx=10, pady=(5, 3))
+
+        ctk.CTkLabel(self.login_frame, text="🔑 登录方式",
+                     font=ctk.CTkFont(size=15, weight="bold")).pack(anchor="w", padx=15, pady=(12, 5))
 
         mode_frame = ctk.CTkFrame(self.login_frame, fg_color="transparent")
         mode_frame.pack(fill="x", padx=15, pady=(0, 5))
@@ -872,13 +1326,15 @@ class WelearnApp:
                            variable=self.login_mode_var, value="password",
                            command=self._on_login_mode_change).pack(side="left")
 
-        # Cookie 输入
+        # Cookie 输入（使用 Textbox 避免大段 JSON 粘贴卡顿）
         self.cookie_panel = ctk.CTkFrame(self.login_frame, fg_color="transparent")
         self.cookie_panel.pack(fill="x", padx=15, pady=(5, 5))
-        self.cookie_entry = ctk.CTkEntry(self.cookie_panel, placeholder_text="在此粘贴浏览器复制的Cookie字符串...")
-        self.cookie_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ctk.CTkLabel(self.cookie_panel, text="Cookie:").pack(anchor="w")
+        self.cookie_entry = ctk.CTkTextbox(self.cookie_panel, height=60, wrap="word",
+                                            font=ctk.CTkFont(size=11))
+        self.cookie_entry.pack(fill="x", padx=(0, 0), pady=(2, 5))
         self.btn_login = ctk.CTkButton(self.cookie_panel, text="登录", width=100, command=self._on_login)
-        self.btn_login.pack(side="right")
+        self.btn_login.pack(anchor="e")
 
         # 密码输入（初始隐藏）
         self.password_panel = ctk.CTkFrame(self.login_frame, fg_color="transparent")
@@ -893,7 +1349,10 @@ class WelearnApp:
         self.login_status.pack(anchor="w", padx=15, pady=(0, 10))
 
         # ── 课程选择 ──
-        self.course_frame = ctk.CTkFrame(page)
+        self.course_frame = ctk.CTkFrame(self.home_scroll, corner_radius=12,
+                                          fg_color=("#f8fafc", "#1e293b"),
+                                          border_width=1,
+                                          border_color=("#e2e8f0", "#334155"))
 
         row1 = ctk.CTkFrame(self.course_frame, fg_color="transparent")
         row1.pack(fill="x", padx=15, pady=(10, 5))
@@ -911,107 +1370,131 @@ class WelearnApp:
                                            command=self._on_unit_selected)
         self.unit_menu.pack(side="left", padx=(10, 10))
 
-        # ── 模式选项卡 ──
-        self.tabview = ctk.CTkTabview(page)
-        self.tabview.pack(fill="both", expand=True, padx=10, pady=5)
+        # ── 任务设置面板（v3.3: 整合刷课+刷时长） ──
+        self.task_frame = ctk.CTkFrame(self.home_scroll, corner_radius=12,
+                                        fg_color=("#f8fafc", "#1e293b"),
+                                        border_width=1,
+                                        border_color=("#e2e8f0", "#334155"))
+        self.task_frame.pack(fill="x", padx=10, pady=5)
 
-        self.tab_curriculum = self.tabview.add("刷课模式")
-        self.tab_time = self.tabview.add("刷时长模式")
-        self._build_curriculum_tab()
-        self._build_time_tab()
+        # 模式选择
+        mode_header = ctk.CTkFrame(self.task_frame, fg_color="transparent")
+        mode_header.pack(fill="x", padx=15, pady=(12, 8))
+        ctk.CTkLabel(mode_header, text="⚡ 任务模式", font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w")
 
-        # ── 日志 ──
-        ctk.CTkLabel(page, text="运行日志", font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=10, pady=(5, 0))
-        self.log_text = ctk.CTkTextbox(page, height=150, wrap="word")
-        self.log_text.pack(fill="both", expand=True, padx=10, pady=(5, 0))
-        self.log_text.configure(state="disabled")
-        self._setup_log_tags()
+        self.task_mode_var = ctk.StringVar(value="curriculum")
+        mode_row = ctk.CTkFrame(self.task_frame, fg_color="transparent")
+        mode_row.pack(fill="x", padx=15, pady=(0, 8))
+        ctk.CTkRadioButton(mode_row, text="📝 刷课并计时（解析题目+答题记录+学习时长）",
+                           variable=self.task_mode_var, value="curriculum",
+                           command=self._on_task_mode_change).pack(anchor="w", pady=2)
+        ctk.CTkRadioButton(mode_row, text="⏱ 仅刷时长（心跳保活，不操作题目）",
+                           variable=self.task_mode_var, value="timeonly",
+                           command=self._on_task_mode_change).pack(anchor="w", pady=2)
 
-    def _build_curriculum_tab(self):
-        ctk.CTkLabel(self.tab_curriculum, text="正确率设置",
-                     font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", padx=15, pady=(15, 10))
+        # 分隔线
+        ctk.CTkFrame(self.task_frame, height=1, fg_color=("#e2e8f0", "#334155")).pack(fill="x", padx=15)
+
+        # ── 正确率设置（仅刷课模式显示） ──
+        self.rate_panel = ctk.CTkFrame(self.task_frame, fg_color="transparent")
+        self.rate_panel.pack(fill="x", padx=15, pady=(6, 0))
+        ctk.CTkLabel(self.rate_panel, text="正确率设置",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", pady=(0, 8))
+
         self.rate_var = ctk.StringVar(value="fixed")
-        fixed_frame = ctk.CTkFrame(self.tab_curriculum, fg_color="transparent")
-        fixed_frame.pack(fill="x", padx=15, pady=2)
-        ctk.CTkRadioButton(fixed_frame, text="固定正确率:", variable=self.rate_var, value="fixed",
+        fixed_frame = ctk.CTkFrame(self.rate_panel, fg_color="transparent")
+        fixed_frame.pack(fill="x", pady=1)
+        ctk.CTkRadioButton(fixed_frame, text="固定:", variable=self.rate_var, value="fixed",
                            command=self._on_rate_mode_change).pack(side="left")
-        self.fixed_rate_entry = ctk.CTkEntry(fixed_frame, width=80, placeholder_text="100")
+        self.fixed_rate_entry = ctk.CTkEntry(fixed_frame, width=65, placeholder_text="100")
         self.fixed_rate_entry.pack(side="left", padx=5)
         self.fixed_rate_entry.insert(0, "100")
         ctk.CTkLabel(fixed_frame, text="%").pack(side="left")
 
-        random_frame = ctk.CTkFrame(self.tab_curriculum, fg_color="transparent")
-        random_frame.pack(fill="x", padx=15, pady=2)
-        ctk.CTkRadioButton(random_frame, text="随机正确率:", variable=self.rate_var, value="random",
+        rand_frame = ctk.CTkFrame(self.rate_panel, fg_color="transparent")
+        rand_frame.pack(fill="x", pady=1)
+        ctk.CTkRadioButton(rand_frame, text="随机:", variable=self.rate_var, value="random",
                            command=self._on_rate_mode_change).pack(side="left")
-        self.rand_min_entry = ctk.CTkEntry(random_frame, width=60, placeholder_text="70")
+        self.rand_min_entry = ctk.CTkEntry(rand_frame, width=55, placeholder_text="70")
         self.rand_min_entry.pack(side="left", padx=5)
         self.rand_min_entry.insert(0, "70")
-        ctk.CTkLabel(random_frame, text="~").pack(side="left")
-        self.rand_max_entry = ctk.CTkEntry(random_frame, width=60, placeholder_text="100")
+        ctk.CTkLabel(rand_frame, text="~").pack(side="left")
+        self.rand_max_entry = ctk.CTkEntry(rand_frame, width=55, placeholder_text="100")
         self.rand_max_entry.pack(side="left", padx=5)
         self.rand_max_entry.insert(0, "100")
-        ctk.CTkLabel(random_frame, text="%").pack(side="left")
+        ctk.CTkLabel(rand_frame, text="%").pack(side="left")
         self._on_rate_mode_change()
 
-        self.btn_start_curriculum = ctk.CTkButton(self.tab_curriculum, text="开始刷课",
-                                                  fg_color="#27ae60", hover_color="#1e8449",
-                                                  height=40, width=200, command=self._on_start_curriculum)
-        self.btn_start_curriculum.pack(pady=(15, 5))
-        self.curriculum_progress_label = ctk.CTkLabel(self.tab_curriculum, text="进度: -/-")
-        self.curriculum_progress_label.pack(pady=(5, 0))
-        self.curriculum_progress_bar = ctk.CTkProgressBar(self.tab_curriculum, width=400)
-        self.curriculum_progress_bar.pack(pady=(5, 5))
-        self.curriculum_progress_bar.set(0)
-        self.curriculum_stats_label = ctk.CTkLabel(self.tab_curriculum,
-                                                   text="方式1 成功:0 失败:0 | 方式2 成功:0 失败:0")
-        self.curriculum_stats_label.pack(pady=(0, 10))
+        # ── 时长 + 线程（共享） ──
+        ctk.CTkFrame(self.task_frame, height=1, fg_color=("#e2e8f0", "#334155")).pack(fill="x", padx=15, pady=(6, 0))
 
-    def _build_time_tab(self):
-        ctk.CTkLabel(self.tab_time, text="时长设置",
-                     font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", padx=15, pady=(15, 10))
-        self.time_var = ctk.StringVar(value="fixed")
-        fixed_frame = ctk.CTkFrame(self.tab_time, fg_color="transparent")
-        fixed_frame.pack(fill="x", padx=15, pady=2)
-        ctk.CTkRadioButton(fixed_frame, text="固定时长:", variable=self.time_var, value="fixed",
+        shared_panel = ctk.CTkFrame(self.task_frame, fg_color="transparent")
+        shared_panel.pack(fill="x", padx=15, pady=(10, 5))
+        ctk.CTkLabel(shared_panel, text="时长与并发设置",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", pady=(0, 8))
+
+        time_mode_row = ctk.CTkFrame(shared_panel, fg_color="transparent")
+        time_mode_row.pack(fill="x", pady=1)
+        self.time_var = ctk.StringVar(value="random")
+        ctk.CTkRadioButton(time_mode_row, text="固定:", variable=self.time_var, value="fixed",
                            command=self._on_time_mode_change).pack(side="left")
-        self.fixed_time_entry = ctk.CTkEntry(fixed_frame, width=80, placeholder_text="30")
+        self.fixed_time_entry = ctk.CTkEntry(time_mode_row, width=65, placeholder_text="30")
         self.fixed_time_entry.pack(side="left", padx=5)
         self.fixed_time_entry.insert(0, "30")
-        ctk.CTkLabel(fixed_frame, text="秒").pack(side="left")
+        ctk.CTkLabel(time_mode_row, text="秒/课").pack(side="left")
 
-        random_frame = ctk.CTkFrame(self.tab_time, fg_color="transparent")
-        random_frame.pack(fill="x", padx=15, pady=2)
-        ctk.CTkRadioButton(random_frame, text="随机时长:", variable=self.time_var, value="random",
+        rand_time_row = ctk.CTkFrame(shared_panel, fg_color="transparent")
+        rand_time_row.pack(fill="x", pady=1)
+        ctk.CTkRadioButton(rand_time_row, text="随机:", variable=self.time_var, value="random",
                            command=self._on_time_mode_change).pack(side="left")
-        self.time_min_entry = ctk.CTkEntry(random_frame, width=60, placeholder_text="10")
+        self.time_min_entry = ctk.CTkEntry(rand_time_row, width=55, placeholder_text="60")
         self.time_min_entry.pack(side="left", padx=5)
-        self.time_min_entry.insert(0, "10")
-        ctk.CTkLabel(random_frame, text="~").pack(side="left")
-        self.time_max_entry = ctk.CTkEntry(random_frame, width=60, placeholder_text="60")
+        self.time_min_entry.insert(0, "60")
+        ctk.CTkLabel(rand_time_row, text="~").pack(side="left")
+        self.time_max_entry = ctk.CTkEntry(rand_time_row, width=55, placeholder_text="120")
         self.time_max_entry.pack(side="left", padx=5)
-        self.time_max_entry.insert(0, "60")
-        ctk.CTkLabel(random_frame, text="秒").pack(side="left")
+        self.time_max_entry.insert(0, "120")
+        ctk.CTkLabel(rand_time_row, text="秒/课").pack(side="left")
         self._on_time_mode_change()
 
-        thread_frame = ctk.CTkFrame(self.tab_time, fg_color="transparent")
-        thread_frame.pack(fill="x", padx=15, pady=(10, 5))
-        ctk.CTkLabel(thread_frame, text="最大线程数:").pack(side="left")
-        self.threads_entry = ctk.CTkEntry(thread_frame, width=80, placeholder_text="100")
+        thread_row = ctk.CTkFrame(shared_panel, fg_color="transparent")
+        thread_row.pack(fill="x", pady=(8, 0))
+        ctk.CTkLabel(thread_row, text="最大线程数:").pack(side="left")
+        self.threads_entry = ctk.CTkEntry(thread_row, width=65, placeholder_text="10")
         self.threads_entry.pack(side="left", padx=5)
-        self.threads_entry.insert(0, "100")
+        self.threads_entry.insert(0, "10")
 
-        self.btn_start_time = ctk.CTkButton(self.tab_time, text="开始刷时长",
-                                            fg_color="#27ae60", hover_color="#1e8449",
-                                            height=40, width=200, command=self._on_start_time)
-        self.btn_start_time.pack(pady=(15, 5))
-        self.time_progress_label = ctk.CTkLabel(self.tab_time, text="进度: -/-")
-        self.time_progress_label.pack(pady=(5, 0))
-        self.time_progress_bar = ctk.CTkProgressBar(self.tab_time, width=400)
-        self.time_progress_bar.pack(pady=(5, 5))
-        self.time_progress_bar.set(0)
-        self.time_stats_label = ctk.CTkLabel(self.tab_time, text="错误: 0 个")
-        self.time_stats_label.pack(pady=(0, 10))
+        # ── 开始按钮 + 进度 ──
+        btn_row = ctk.CTkFrame(self.task_frame, fg_color="transparent")
+        btn_row.pack(fill="x", padx=15, pady=(12, 5))
+        self.btn_start_task = ctk.CTkButton(btn_row, text="🚀 开始运行",
+                                            fg_color="#a855f7", hover_color="#9333ea",
+                                            height=42, width=180, corner_radius=8,
+                                            font=ctk.CTkFont(size=14, weight="bold"),
+                                            command=self._on_start_task)
+        self.btn_start_task.pack(side="left")
+
+        # 进度条 + 统计
+        progress_frame = ctk.CTkFrame(self.task_frame, fg_color="transparent")
+        progress_frame.pack(fill="x", padx=15, pady=(0, 10))
+        self.task_progress_label = ctk.CTkLabel(progress_frame, text="进度: -/-", font=ctk.CTkFont(size=12))
+        self.task_progress_label.pack(anchor="w")
+        self.task_progress_bar = ctk.CTkProgressBar(progress_frame, width=500)
+        self.task_progress_bar.pack(fill="x", pady=(3, 3))
+        self.task_progress_bar.set(0)
+        self.task_stats_label = ctk.CTkLabel(progress_frame, text="", font=ctk.CTkFont(size=11),
+                                              text_color=("#64748b", "#94a3b8"))
+        self.task_stats_label.pack(anchor="w")
+
+        # ── 日志已移至侧边栏 ──
+
+    def _on_task_mode_change(self):
+        """切换任务模式时显示/隐藏正确率面板"""
+        if self.task_mode_var.get() == "curriculum":
+            self.rate_panel.pack(fill="x", padx=15, pady=(6, 0),
+                                before=self.task_frame.winfo_children()[-4])
+        else:
+            self.rate_panel.pack_forget()
 
     # ═══ 赞助页 ═══════════════════════════════════════
     def _build_donate_page(self):
@@ -1136,7 +1619,7 @@ class WelearnApp:
         self.lang_menu = ctk.CTkOptionMenu(container, values=["中文", "English"], width=200,
                                            command=self._on_lang_change)
         self.lang_menu.pack(anchor="w", padx=20, pady=(0, 10))
-        self.lang_menu.set("中文")
+        self.lang_menu.set("中文" if self.lang == "zh" else "English")
 
         # 外观
         ctk.CTkLabel(container, text="外观 / Theme",
@@ -1144,12 +1627,14 @@ class WelearnApp:
         self.theme_menu = ctk.CTkOptionMenu(container, values=["跟随系统", "浅色", "深色"], width=200,
                                             command=self._on_theme_change)
         self.theme_menu.pack(anchor="w", padx=20, pady=(0, 10))
-        self.theme_menu.set("跟随系统")
+        theme_labels = {"System": "跟随系统", "Light": "浅色", "Dark": "深色"}
+        saved_appearance = self._config.get("appearance", "System")
+        self.theme_menu.set(theme_labels.get(saved_appearance, "跟随系统"))
 
         # 关于
         ctk.CTkLabel(container, text="关于",
                      font=ctk.CTkFont(size=15, weight="bold")).pack(anchor="w", padx=20, pady=(10, 8))
-        ctk.CTkLabel(container, text="当前版本: v3.1",
+        ctk.CTkLabel(container, text="当前版本: v3.5",
                      font=ctk.CTkFont(size=14), text_color="gray").pack(anchor="w", padx=20, pady=2)
         self.github_link = ctk.CTkButton(container, text="项目主页: github.com/xuebi0218/welearn-gui",
                                           font=ctk.CTkFont(size=13), fg_color="transparent",
@@ -1166,14 +1651,18 @@ class WelearnApp:
 
     # ═══ 底部状态栏 ═══════════════════════════════════
     def _build_statusbar(self):
-        self.status_frame = ctk.CTkFrame(self.root, height=42)
+        self.status_frame = ctk.CTkFrame(self.root, height=40,
+                                          fg_color=("#f1f5f9", "#0f172a"))
         self.status_frame.pack(side="bottom", fill="x", padx=0, pady=0)
 
-        self.status_label = ctk.CTkLabel(self.status_frame, text="● 就绪", text_color="gray")
+        self.status_label = ctk.CTkLabel(self.status_frame, text="● 就绪",
+                                          text_color=("#64748b", "#94a3b8"),
+                                          font=ctk.CTkFont(size=12))
         self.status_label.pack(side="left", padx=15, pady=8)
 
-        self.btn_stop = ctk.CTkButton(self.status_frame, text="停止", width=70,
-                                      fg_color="#c0392b", hover_color="#a93226",
+        self.btn_stop = ctk.CTkButton(self.status_frame, text="⏹ 停止", width=80, height=30,
+                                      fg_color="#ef4444", hover_color="#dc2626",
+                                      corner_radius=6, font=ctk.CTkFont(size=12),
                                       command=self._on_stop, state="disabled")
         self.btn_stop.pack(side="right", padx=10, pady=5)
 
@@ -1213,10 +1702,9 @@ class WelearnApp:
         self.btn_refresh.configure(state=state)
         self.course_menu.configure(state=state)
         self.unit_menu.configure(state=state)
-        self.btn_start_curriculum.configure(state=state)
-        self.btn_start_time.configure(state=state)
-        self.btn_stop.configure(state=stop_state)
-        color = "#3498db" if running else "gray"
+        self.btn_start_task.configure(state=state)
+        self.btn_stop.configure(state=stop_state, text="⏹ 停止")
+        color = "#38bdf8" if running else ("#64748b", "#94a3b8")
         self.status_label.configure(text=f"● {status_text}", text_color=color)
 
     # ═══ 事件处理 ═════════════════════════════════════
@@ -1232,7 +1720,7 @@ class WelearnApp:
 
     def _on_login(self):
         if self.login_mode == "cookie":
-            cookie = self.cookie_entry.get().strip()
+            cookie = self.cookie_entry.get("1.0", "end-1c").strip()
             if not cookie:
                 self.login_status.configure(text="请输入Cookie!", text_color="red")
                 return
@@ -1295,75 +1783,104 @@ class WelearnApp:
         self._set_running(True, "刷新课程列表...")
         threading.Thread(target=thread_refresh_courses, args=(self,), daemon=True).start()
 
-    def _on_start_curriculum(self):
+    def _on_start_task(self):
         if not self.selected_cid or not self.uid:
             self._log("[!] 请先选择课程和单元", "log_error")
             return
-        try:
-            if self.rate_var.get() == "fixed":
-                self.curriculum_rate = int(self.fixed_rate_entry.get())
-                self.curriculum_random = False
-            else:
-                lo, hi = int(self.rand_min_entry.get()), int(self.rand_max_entry.get())
-                if lo > hi:
-                    self._log("[!] 随机正确率范围错误", "log_error")
-                    return
-                self.curriculum_rate = [lo, hi]
-                self.curriculum_random = True
-        except ValueError:
-            self._log("[!] 正确率输入格式错误", "log_error")
-            return
-        self._log("─" * 50)
-        self._log("开始刷课模式...")
-        self._set_running(True, "刷课进行中...")
-        self.stop_requested = False
-        self.curriculum_progress_bar.set(0)
-        self.curriculum_stats_label.configure(text="方式1 成功:0 失败:0 | 方式2 成功:0 失败:0")
-        threading.Thread(target=thread_curriculum_execute, args=(self,), daemon=True).start()
 
-    def _on_start_time(self):
-        if not self.selected_cid or not self.uid:
-            self._log("[!] 请先选择课程和单元", "log_error")
-            return
+        mode = self.task_mode_var.get()  # "curriculum" or "timeonly"
+
         try:
+            # 时长参数（两种模式共用）
             if self.time_var.get() == "fixed":
-                self.time_duration = int(self.fixed_time_entry.get())
-                self.time_mode = 1
+                duration_val = int(self.fixed_time_entry.get())
+                if mode == "curriculum":
+                    self.curriculum_duration = duration_val
+                else:
+                    self.time_duration = duration_val
+                    self.time_mode = 1
             else:
                 lo, hi = int(self.time_min_entry.get()), int(self.time_max_entry.get())
                 if lo > hi:
                     self._log("[!] 随机时长范围错误", "log_error")
                     return
-                self.time_duration = [lo, hi]
-                self.time_mode = 2
-            self.time_max_threads = int(self.threads_entry.get())
+                if mode == "curriculum":
+                    self.curriculum_duration = [lo, hi]
+                else:
+                    self.time_duration = [lo, hi]
+                    self.time_mode = 2
+
+            # 线程数（共用）
+            max_threads = int(self.threads_entry.get())
+            if mode == "curriculum":
+                self.curriculum_max_threads = max_threads
+            else:
+                self.time_max_threads = max_threads
+
+            # 正确率（仅刷课模式）
+            if mode == "curriculum":
+                if self.rate_var.get() == "fixed":
+                    self.curriculum_rate = int(self.fixed_rate_entry.get())
+                    self.curriculum_random = False
+                else:
+                    lo, hi = int(self.rand_min_entry.get()), int(self.rand_max_entry.get())
+                    if lo > hi:
+                        self._log("[!] 随机正确率范围错误", "log_error")
+                        return
+                    self.curriculum_rate = [lo, hi]
+                    self.curriculum_random = True
         except ValueError:
-            self._log("[!] 时长或线程数格式错误", "log_error")
+            self._log("[!] 输入格式错误", "log_error")
             return
-        self._log("─" * 50)
-        self._log("开始刷时长模式...")
-        self._set_running(True, "刷时长进行中...")
+
+        self._log("─" * 55)
         self.stop_requested = False
-        self.time_progress_bar.set(0)
-        self.time_stats_label.configure(text="错误: 0 个")
-        threading.Thread(target=thread_time_execute, args=(self,), daemon=True).start()
+        self.task_progress_bar.set(0)
+        self.task_stats_label.configure(text="")
+
+        if mode == "curriculum":
+            dur = self.curriculum_duration
+            dur_str = f"{dur}s" if isinstance(dur, int) else f"{dur[0]}~{dur[1]}s"
+            rate = self.curriculum_rate
+            rate_str = f"{rate}%" if isinstance(rate, int) else f"{rate[0]}~{rate[1]}%"
+            self._log(f"📝 刷课并计时 | 正确率={rate_str} | 时长={dur_str} | 线程={max_threads}", "log_warning")
+            self._set_running(True, "刷课进行中...")
+            threading.Thread(target=thread_curriculum_execute, args=(self,), daemon=True).start()
+        else:
+            dur = self.time_duration
+            dur_str = f"{dur}s" if isinstance(dur, int) else f"{dur[0]}~{dur[1]}s"
+            self._log(f"⏱ 仅刷时长 | 时长={dur_str} | 线程={max_threads}", "log_warning")
+            self._set_running(True, "刷时长进行中...")
+            threading.Thread(target=thread_time_execute, args=(self,), daemon=True).start()
+
+    def _on_close(self):
+        """窗口关闭保护：运行中不允许直接关闭"""
+        if self.running:
+            self._log("[!] 任务运行中，请先点击底部「停止」按钮等待任务结束，再关闭窗口", "log_warning")
+            return
+        self.root.destroy()
 
     def _on_stop(self):
         self.stop_requested = True
+        self.btn_stop.configure(state="disabled", text="⏳ 停止中...")
         self.status_label.configure(text="正在停止...", text_color="orange")
-        self._log("[!] 正在停止，请等待当前操作完成...", "log_warning")
+        mode = "刷课" if self.task_mode_var.get() == "curriculum" else "刷时长"
+        self._log(f"[!] ⏹ 用户请求停止{mode}任务，正在等待当前操作完成...", "log_warning")
+        self._log("[!] 提示：正在 sleep 的线程需要等待当前分段结束（最多5秒）", "log_warning")
 
     def _on_lang_change(self, choice):
         if choice == "中文":
             self.lang = "zh"
         else:
             self.lang = "en"
-        # 简单刷新关键标签
+        self._save_prefs()
         self._refresh_labels()
 
     def _on_theme_change(self, choice):
         theme_map = {"跟随系统": "System", "浅色": "Light", "深色": "Dark"}
-        ctk.set_appearance_mode(theme_map.get(choice, "System"))
+        mode = theme_map.get(choice, "System")
+        ctk.set_appearance_mode(mode)
+        self._save_prefs()
 
     def _on_open_github(self):
         import webbrowser
@@ -1377,19 +1894,21 @@ class WelearnApp:
                 timeout=10)
             if resp.status_code == 200:
                 latest = resp.json()["tag_name"]
-                self._log(f"最新版本: {latest}，当前: v3.1")
+                self._log(f"最新版本: {latest}，当前: v3.5")
             else:
                 self._log("GitHub 仓库尚未设置，无法检查更新", "log_warning")
         except Exception:
             self._log("GitHub 仓库尚未设置，无法检查更新", "log_warning")
 
     def _refresh_labels(self):
-        # 刷新导航标签
-        labels = {"home": ("主页", "Home"), "donate": ("赞助", "Donate"),
-                  "help": ("帮助", "Help"), "settings": ("设置", "Settings")}
+        # 刷新导航标签（保留图标）
+        labels = {"home": ("🏠  主页", "🏠  Home"),
+                  "donate": ("☕  赞助", "☕  Donate"),
+                  "help": ("📖  帮助", "📖  Help"),
+                  "settings": ("⚙️  设置", "⚙️  Settings")}
         for key, (zh, en) in labels.items():
             self.nav_buttons[key].configure(text=zh if self.lang == "zh" else en)
-        self.root.title("Welearn 刷课工具 v3.1" if self.lang == "zh" else "Welearn Tool v3.1")
+        self.root.title("Welearn 刷课工具 v3.5" if self.lang == "zh" else "Welearn Tool v3.5")
 
     def _show_disclaimer(self):
         dialog = ctk.CTkToplevel(self.root)
@@ -1406,7 +1925,7 @@ class WelearnApp:
 
         ctk.CTkLabel(dialog, text="Welearn 刷课工具",
                      font=ctk.CTkFont(size=20, weight="bold")).pack(pady=(25, 5))
-        ctk.CTkLabel(dialog, text="v3.1 · 免费开源", text_color="gray").pack(pady=(0, 20))
+        ctk.CTkLabel(dialog, text="v3.5 · 免费开源", text_color="gray").pack(pady=(0, 20))
         ctk.CTkFrame(dialog, height=1, fg_color="gray").pack(fill="x", padx=40, pady=(0, 15))
 
         ctk.CTkLabel(dialog, text="本软件完全免费，仅供学习交流使用。\n\n"
@@ -1417,11 +1936,18 @@ class WelearnApp:
                      font=ctk.CTkFont(size=14), justify="left", wraplength=450).pack(pady=(0, 15))
 
         self.disclaimer_skip = ctk.BooleanVar(value=False)
+
+        def _on_disclaimer_close():
+            if self.disclaimer_skip.get():
+                self._config["disclaimer_skip"] = True
+                _save_config(self._config)
+            dialog.destroy()
+
         ctk.CTkCheckBox(dialog, text="下次不再显示", variable=self.disclaimer_skip,
                         font=ctk.CTkFont(size=12)).pack(pady=(0, 15))
         ctk.CTkButton(dialog, text="同意并继续", height=38, width=200,
                       fg_color="#27ae60", hover_color="#1e8449",
-                      command=dialog.destroy).pack(pady=(0, 10))
+                      command=_on_disclaimer_close).pack(pady=(0, 10))
         self.root.wait_window(dialog)
 
     # ═══ 消息处理 ═════════════════════════════════════
@@ -1455,23 +1981,33 @@ class WelearnApp:
             self._log(f"获取单元成功，共 {len(self.units)} 个单元")
         elif t == "progress":
             current, total = msg["current"], msg["total"]
+            remaining = total - current
             ratio = current / total if total > 0 else 0
-            self.curriculum_progress_bar.set(ratio)
-            self.time_progress_bar.set(ratio)
-            label_text = f"进度: {current}/{total}"
-            self.curriculum_progress_label.configure(text=label_text)
-            self.time_progress_label.configure(text=label_text)
+            self.task_progress_bar.set(ratio)
+            if ratio >= 1.0:
+                self.task_progress_label.configure(text=f"✅ 全部完成！共 {total} 个课时已处理", text_color="#27ae60")
+            elif ratio > 0:
+                self.task_progress_label.configure(text=f"⏳ 进度: {current}/{total} | 剩余 {remaining} 个 | 请耐心等待...", text_color="#38bdf8")
+            else:
+                self.task_progress_label.configure(text=f"📊 进度: {current}/{total} | 待处理 {remaining} 个")
         elif t == "curriculum_complete":
-            self.curriculum_stats_label.configure(
-                text=f"方式1 成功:{msg['way1_ok']} 失败:{msg['way1_fail']} | "
+            total = msg['way1_ok'] + msg['way1_fail']
+            self.task_stats_label.configure(
+                text=f"共 {total} 节 | 方式1 成功:{msg['way1_ok']} 失败:{msg['way1_fail']} | "
                      f"方式2 成功:{msg['way2_ok']} 失败:{msg['way2_fail']}")
-            self._log("刷课已停止。" if msg["stopped"] else "刷课全部完成！",
-                      "log_warning" if msg["stopped"] else "log_success")
+            if msg["stopped"]:
+                self._log(f"⚠️ 刷课已停止 | 已完成 {msg['way1_ok']+msg['way2_ok']} 次提交", "log_warning")
+            else:
+                self._log("─" * 55)
+                self._log(f"🎉 刷课全部完成！共 {total} 节 | 成功 {msg['way1_ok']+msg['way2_ok']} 次", "log_success")
             self._set_running(False, "就绪")
         elif t == "time_complete":
-            self.time_stats_label.configure(text=f"错误: {msg['errors']} 个")
-            self._log("刷时长已停止。" if msg["stopped"] else "刷时长全部完成！",
-                      "log_warning" if msg["stopped"] else "log_success")
+            self.task_stats_label.configure(text=f"完成 | 错误: {msg['errors']} 个")
+            if msg["stopped"]:
+                self._log(f"⚠️ 刷时长已停止 | 错误 {msg['errors']} 个", "log_warning")
+            else:
+                self._log("─" * 55)
+                self._log(f"🎉 刷时长全部完成！错误 {msg['errors']} 个", "log_success")
             self._set_running(False, "就绪")
 
     def _populate_course_menu(self):

@@ -6,12 +6,12 @@ echo ==========================================
 echo.
 echo 正在清理旧的构建文件...
 if exist build rmdir /s /q build
-if exist dist rmdir /s /q dist
-if exist *.spec del /q *.spec
+if exist dist\WelearnGUI.exe del /q dist\WelearnGUI.exe
+if exist WelearnGUI.spec del /q WelearnGUI.spec
 
 echo.
 echo 开始打包...
-pyinstaller --clean --onefile --windowed --name WelearnGUI --collect-data customtkinter --hidden-import queue src\welearn_gui.py
+pyinstaller --clean --onefile --windowed --name WelearnGUI --add-data "src/donate_qr.jpg;src/" --add-data "src/help_1.jpg;src/" --add-data "src/help_2.jpg;src/" --add-data "src/help_3.jpg;src/" --collect-data customtkinter --hidden-import queue --hidden-import PIL --hidden-import PIL.Image src\welearn_gui.py
 
 echo.
 echo ==========================================

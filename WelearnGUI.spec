@@ -1,12 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_data_files
+
+datas = [('src/donate_qr.jpg', 'src/'), ('src/help_1.jpg', 'src/'), ('src/help_2.jpg', 'src/'), ('src/help_3.jpg', 'src/'), ('src/nobi.png', 'src/')]
+datas += collect_data_files('customtkinter')
 
 
 a = Analysis(
-    ['WelearnCurriculumFinsh.py'],
+    ['src\\welearn_gui.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=[],
+    datas=datas,
+    hiddenimports=['queue', 'PIL', 'PIL.Image'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -22,14 +26,14 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='WelearnCurriculumFinsh',
+    name='WelearnGUI',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

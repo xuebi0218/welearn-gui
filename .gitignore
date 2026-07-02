@@ -1,5 +1,34 @@
-# Object file
-*.o
+# Build outputs
+dist/
+build/
 
-# Ada Library Information
-*.ali
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Sensitive
+*.token
+.env
+*.old
+
+# Claude Code
+.claude/
+
+# Backup / legacy / debug
+src/*_backup*.py
+src/*_backup_*.py
+src/ocr_results.json
+legacy/
+graphify-out/
+resources/
