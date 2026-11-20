@@ -32,3 +32,13 @@ src/ocr_results.json
 legacy/
 graphify-out/
 resources/
+
+# Local-only: platform assets & private dumps
+tools/lms.js
+tools/studycourse.html
+tools/jquery.ui.effect.js
+tools/_*.log
+err.log
+out.log
+项目结构总览.html
+*.log

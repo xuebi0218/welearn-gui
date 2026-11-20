@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_data_files
 
-datas = [('src/donate_qr.jpg', 'src/'), ('src/help_1.jpg', 'src/'), ('src/help_2.jpg', 'src/'), ('src/help_3.jpg', 'src/'), ('src/nobi.png', 'src/')]
+datas = [('src/donate_qr.jpg', 'src/'), ('src/help_1.jpg', 'src/'), ('src/help_2.jpg', 'src/'), ('src/help_3.jpg', 'src/'), ('src/mascot.png', 'src/'), ('src/mascot_classic.png', 'src/'), ('src/strip.png', 'src/'), ('src/banner.png', 'src/'), ('src/anim_0.png', 'src/'), ('src/anim_1.png', 'src/'), ('src/anim_2.png', 'src/'), ('src/anim_3.png', 'src/'), ('src/anim_4.png', 'src/'), ('src/anim_5.png', 'src/')]
 datas += collect_data_files('customtkinter')
 
 
@@ -10,7 +10,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=datas,
-    hiddenimports=['queue', 'PIL', 'PIL.Image'],
+    hiddenimports=['queue', 'PIL', 'PIL.Image', 'brotli'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
