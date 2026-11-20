@@ -1337,7 +1337,7 @@ class WelearnApp:
         ctk.set_default_color_theme("blue")
 
         self.root = ctk.CTk()
-        self.root.title("Welearn 刷课工具 v3.7")
+        self.root.title("Welearn 刷课工具 v3.8")
         self.root.geometry("1060x700")
         self.root.minsize(960, 640)
 
@@ -1504,7 +1504,7 @@ class WelearnApp:
         bottom_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         bottom_frame.pack(side="bottom", fill="x", padx=15, pady=(4, 10))
         ctk.CTkFrame(bottom_frame, height=1, fg_color=("#30363d", "#21262d")).pack(fill="x", pady=(0, 6))
-        ctk.CTkLabel(bottom_frame, text="v3.7 · 免费开源",
+        ctk.CTkLabel(bottom_frame, text="v3.8 · 免费开源",
                      font=ctk.CTkFont(size=9),
                      text_color=("#484f58", "#484f58")).pack(anchor="w")
 
@@ -2403,7 +2403,7 @@ class WelearnApp:
                 timeout=10)
             if resp.status_code == 200:
                 latest = resp.json()["tag_name"]
-                self._log(f"最新版本: {latest}，当前: v3.7")
+                self._log(f"最新版本: {latest}，当前: v3.8")
             else:
                 self._log("GitHub 仓库尚未设置，无法检查更新", "log_warning")
         except Exception:
@@ -2417,7 +2417,7 @@ class WelearnApp:
                   "settings": ("⚙️  设置", "⚙️  Settings")}
         for key, (zh, en) in labels.items():
             self.nav_buttons[key].configure(text=zh if self.lang == "zh" else en)
-        self.root.title("Welearn 刷课工具 v3.7" if self.lang == "zh" else "Welearn Tool v3.5")
+        self.root.title("Welearn 刷课工具 v3.8" if self.lang == "zh" else "Welearn Tool v3.8")
 
     def _show_disclaimer(self):
         dialog = ctk.CTkToplevel(self.root)
@@ -2434,7 +2434,7 @@ class WelearnApp:
 
         ctk.CTkLabel(dialog, text="Welearn 刷课工具",
                      font=ctk.CTkFont(size=20, weight="bold")).pack(pady=(25, 5))
-        ctk.CTkLabel(dialog, text="v3.7 · 免费开源", text_color="gray").pack(pady=(0, 20))
+        ctk.CTkLabel(dialog, text="v3.8 · 免费开源", text_color="gray").pack(pady=(0, 20))
         ctk.CTkFrame(dialog, height=1, fg_color="gray").pack(fill="x", padx=40, pady=(0, 15))
 
         ctk.CTkLabel(dialog, text="本软件完全免费，仅供学习交流使用。\n\n"
