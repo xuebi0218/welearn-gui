@@ -39,6 +39,7 @@ app.running = True
 app._render_lanes()
 
 app.task_progress_bar.set(0.35)
+app.task_progress_bar.set_ticks(17)
 app.prog_pct.configure(text="35%")
 app.task_progress_label.configure(text="进度 6/17 · 剩余 11 个")
 app.eta_label.configure(text="预计还需约 28 分钟")

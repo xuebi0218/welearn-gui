@@ -6,6 +6,7 @@ v3.2: 新增题目解析和答题记录提交功能。
 v3.3: 修复章节学习时长为0的bug，刷课模式支持多线程并发+真实学习时长。
 v3.4: 修复刷时长模式心跳未触发导致时长不增长的bug。
 v3.5: 修复最后一项卡住问题(join超时类型错误)、停止按钮即时响应(分段sleep+轮询join)、增强日志输出。
+v4.1: 渐变圆角进度条（PIL 渲染）+ 状态配色（正常青蓝紫/等待琥珀/中断砖红/完成青绿）+ 节数刻度
 v4.0: 进度区重做（总览卡+每路进度条+结果对账）+ 只刷课模式
 v3.9: 题目解析补全（et-blank 全部 4 种写法）+ 单节上限 + 实时进度
 v3.8: 界面重绘——渐变横幅 + 立绘动效，配色统一为深海色系。
@@ -29,8 +30,191 @@ from urllib.parse import urlparse, parse_qs
 
 import requests
 import customtkinter as ctk
-from PIL import Image
+import tkinter as tk
+from PIL import Image, ImageDraw, ImageTk
 from tkinter import messagebox
+
+# ── 渐变进度条组件 ────────────────────────────────────
+
+def _hex_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _mix(c1, c2, t):
+    return tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
+
+
+def _gradient_stops(colors, n):
+    """把若干色标均匀插值成 n 段 RGB 列表。"""
+    cols = [_hex_rgb(c) for c in colors]
+    out = []
+    seg = len(cols) - 1
+    for i in range(n):
+        t = i / max(1, n - 1) * seg
+        k = min(seg - 1, int(t))
+        out.append(_mix(cols[k], cols[k + 1], t - k))
+    return out
+
+
+class GradientBar(tk.Canvas):
+    """圆角渐变进度条：轨道 + 渐变填充 + 高光 + 末端光点。"""
+
+    TRACK = {"dark": "#1a2942", "light": "#e6edf7"}
+    EDGE = {"dark": "#2a3f63", "light": "#d2dcec"}
+    BG = {"dark": "#0d1626", "light": "#ffffff"}
+
+    def __init__(self, master, width=380, height=12, radius=None,
+                 colors=("#4cc9d6", "#5b8def", "#8b7cf0"), value=0.0,
+                 ticks=None, animate=True, bg=None, **kw):
+        self._bh = int(height)
+        self._bw = int(width)
+        self._br = int(radius if radius else height / 2)
+        self._bcolors = colors
+        self._banimate = animate
+        self._btarget = max(0.0, min(1.0, float(value)))
+        self._bcur = self._btarget
+        self._bticks = ticks
+        self._bimg = None
+        self._banim_job = None
+        mode = ctk.get_appearance_mode().lower()
+        bgc = bg or self.BG.get(mode, "#0d1626")
+        super().__init__(master, width=self._bw, height=self._bh,
+                         bg=bgc, highlightthickness=0, bd=0, **kw)
+        self._bbg = bgc
+        self.bind("<Configure>", self._on_conf)
+        self.after(30, self._render)
+
+    # ── 对外接口，与 CTkProgressBar 保持一致 ──
+    def set(self, value, animate=None):
+        value = max(0.0, min(1.0, float(value)))
+        self._btarget = value
+        if animate is None:
+            animate = self._banimate
+        if not animate or abs(value - self._bcur) < 0.001:
+            self._bcur = value
+            self._render()
+            return
+        self._animate_to(value)
+
+    def get(self):
+        return self._bcur
+
+    def set_ticks(self, n):
+        """按节数在条上画刻度（n<=48 才画，太密就不画了）。"""
+        self._bticks = n if (n and 1 < n <= 48) else None
+        self._render()
+
+    def set_colors(self, colors):
+        """切换渐变配色（例如某一路卡住时换成琥珀色）。"""
+        if colors == self._bcolors:
+            return
+        self._bcolors = colors
+        self._render()
+
+    def set_bg(self, color):
+        self._bbg = color
+        self.configure(bg=color)
+        self._render()
+
+    # ── 动画 ──
+    def _animate_to(self, target):
+        if self._banim_job:
+            try:
+                self.after_cancel(self._banim_job)
+            except Exception:
+                pass
+        start = self._bcur
+        steps = 14
+        i = [0]
+
+        def _step():
+            i[0] += 1
+            t = i[0] / steps
+            ease = 1 - (1 - t) ** 3          # ease-out cubic
+            self._bcur = start + (target - start) * ease
+            self._render()
+            if i[0] < steps:
+                self._banim_job = self.after(16, _step)
+            else:
+                self._bcur = target
+                self._banim_job = None
+                self._render()
+
+        self._banim_job = self.after(16, _step)
+
+    # ── 绘制 ──
+    def _on_conf(self, event):
+        if event.width > 8 and abs(event.width - self._bw) > 2:
+            self._bw = event.width
+            self._render()
+
+    def _render(self):
+        try:
+            w, h, r = max(8, self._bw), max(4, self._bh), self._br
+            mode = ctk.get_appearance_mode().lower()
+            base = Image.new("RGB", (w, h), _hex_rgb(self._bbg))
+            canvas = base.convert("RGBA")
+
+            # 轨道
+            track = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            ImageDraw.Draw(track).rounded_rectangle(
+                (0, 0, w - 1, h - 1), radius=r,
+                fill=_hex_rgb(self.TRACK.get(mode, "#16233c")) + (255,),
+                outline=_hex_rgb(self.EDGE.get(mode, "#22355a")) + (255,), width=1)
+            canvas = Image.alpha_composite(canvas, track)
+
+            # 填充：青 → 靛 → 紫
+            fw = int(round(w * self._bcur))
+            if fw >= 2:
+                fw = min(w, max(fw, h))
+                stops = _gradient_stops(self._bcolors, fw)
+                fill = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+                mask = Image.new("L", (w, h), 0)
+                ImageDraw.Draw(mask).rounded_rectangle(
+                    (1, 1, fw - 1, h - 2), radius=max(1, r - 1), fill=255)
+                tint = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+                td = ImageDraw.Draw(tint)
+                for x in range(fw):
+                    td.line([(x, 1), (x, h - 2)], fill=stops[min(x, fw - 1)] + (255,))
+                fill.paste(tint, (0, 0), mask)
+
+                # 上半高光（圆柱感）
+                hl = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+                ImageDraw.Draw(hl).rounded_rectangle(
+                    (1, 1, fw - 1, max(2, 1 + int((h - 2) * 0.45))),
+                    radius=max(1, r - 2), fill=(255, 255, 255, 52))
+                fill = Image.alpha_composite(fill, Image.composite(
+                    hl, Image.new("RGBA", (w, h), (0, 0, 0, 0)), mask))
+                canvas = Image.alpha_composite(canvas, fill)
+
+                # 末端光点
+                if self._bcur < 0.995 and fw > h:
+                    dot = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+                    dd = ImageDraw.Draw(dot)
+                    rr = max(1.5, (h - 5) / 2.0)
+                    cx, cy = fw - 1, h / 2.0
+                    dd.ellipse((cx - rr, cy - rr, cx + rr, cy + rr),
+                               fill=(240, 252, 255, 235))
+                    canvas = Image.alpha_composite(canvas, dot)
+
+            # 节数刻度
+            if self._bticks:
+                tick = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+                tk_d = ImageDraw.Draw(tick)
+                for i in range(1, self._bticks):
+                    x = 1 + int((w - 2) * i / self._bticks)
+                    inside = x <= int(w * self._bcur)
+                    tk_d.line([(x, 2), (x, h - 3)],
+                              fill=(255, 255, 255, 96) if inside else (150, 172, 205, 70))
+                canvas = Image.alpha_composite(canvas, tick)
+
+            self._bimg = ImageTk.PhotoImage(canvas.convert("RGB"))
+            self.delete("all")
+            self.create_image(0, 0, anchor="nw", image=self._bimg)
+        except Exception:
+            pass
+
 
 # ── 常量 ──────────────────────────────────────────────
 
@@ -1400,7 +1584,7 @@ class WelearnApp:
         ctk.set_default_color_theme("blue")
 
         self.root = ctk.CTk()
-        self.root.title("Welearn 刷课工具 v4.0")
+        self.root.title("Welearn 刷课工具 v4.1")
         self.root.geometry("1060x700")
         self.root.minsize(960, 640)
 
@@ -1509,13 +1693,11 @@ class WelearnApp:
         dot = ctk.CTkLabel(row, text="●", width=14, font=ctk.CTkFont(size=11),
                            text_color=("#94a3b8", "#64748b"))
         dot.pack(side="left")
-        name = ctk.CTkLabel(row, text=f"L{lane_id + 1}", width=118, anchor="w",
+        name = ctk.CTkLabel(row, text=f"L{lane_id + 1}", width=104, anchor="w",
                             font=ctk.CTkFont(size=11))
         name.pack(side="left", padx=(2, 6))
-        bar = ctk.CTkProgressBar(row, width=104, height=6, corner_radius=3,
-                                 progress_color=("#4cc9d6", "#5b8def"))
+        bar = GradientBar(row, width=136, height=8, radius=4, animate=True)
         bar.pack(side="left")
-        bar.set(0)
         pct = ctk.CTkLabel(row, text="0%", width=34, font=ctk.CTkFont(size=10),
                            text_color=("#64748b", "#8aa0c0"))
         pct.pack(side="left", padx=(6, 0))
@@ -1547,8 +1729,17 @@ class WelearnApp:
             if st.get("done"):
                 w["dot"].configure(text_color=("#16a34a", "#4ade80"))
                 w["info"].configure(text="已完成")
+                if hasattr(w["bar"], "set_colors"):
+                    w["bar"].set_colors(("#39d0a6", "#33c7b8", "#2fb3c9"))
                 continue
             idle = now - float(st.get("ts") or now)
+            if hasattr(w["bar"], "set_colors"):
+                if idle > 120:
+                    w["bar"].set_colors(("#e2705c", "#d95b48", "#c94a3c"))
+                elif idle > 45:
+                    w["bar"].set_colors(("#f0b45f", "#e38b3c", "#d4742a"))
+                else:
+                    w["bar"].set_colors(("#4cc9d6", "#5b8def", "#8b7cf0"))
             eta = max(0, tg - el)
             clock = f"{el // 60:02d}:{el % 60:02d}/{tg // 60:02d}:{tg % 60:02d}"
             if running and idle > 120:
@@ -1683,7 +1874,7 @@ class WelearnApp:
         bottom_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         bottom_frame.pack(side="bottom", fill="x", padx=15, pady=(4, 10))
         ctk.CTkFrame(bottom_frame, height=1, fg_color=("#30363d", "#21262d")).pack(fill="x", pady=(0, 6))
-        ctk.CTkLabel(bottom_frame, text="v4.0 · 免费开源",
+        ctk.CTkLabel(bottom_frame, text="v4.1 · 免费开源",
                      font=ctk.CTkFont(size=9),
                      text_color=("#484f58", "#484f58")).pack(anchor="w")
 
@@ -2013,10 +2204,9 @@ class WelearnApp:
                                       text_color=("#64748b", "#8aa0c0"))
         self.eta_label.pack(side="right", pady=(8, 0))
 
-        self.task_progress_bar = ctk.CTkProgressBar(progress_frame, height=10, corner_radius=5,
-                                                    progress_color=("#4cc9d6", "#5b8def"))
-        self.task_progress_bar.pack(fill="x", padx=14, pady=(4, 8))
-        self.task_progress_bar.set(0)
+        self.task_progress_bar = GradientBar(progress_frame, width=520, height=14,
+                                             radius=7, animate=True)
+        self.task_progress_bar.pack(fill="x", padx=14, pady=(6, 8))
 
         # 统计行（单行文本，避免窄窗口下被裁）
         self.stat_line = ctk.CTkLabel(progress_frame, text="已完成 0 · 进行中 0 · 待处理 0",
@@ -2635,7 +2825,7 @@ class WelearnApp:
         if self.lesson_only:
             # 只刷课：不补时长，只给到"平台肯收"的最小在线时间
             self.curriculum_duration = [30, 45]
-        self.task_progress_bar.set(0)
+        self.task_progress_bar.set(0, animate=False)
         if hasattr(self, "_lane_state"):
             self._lane_state.clear()
             self._render_lanes()
@@ -2706,7 +2896,7 @@ class WelearnApp:
                 timeout=10)
             if resp.status_code == 200:
                 latest = resp.json()["tag_name"]
-                self._log(f"最新版本: {latest}，当前: v4.0")
+                self._log(f"最新版本: {latest}，当前: v4.1")
             else:
                 self._log("GitHub 仓库尚未设置，无法检查更新", "log_warning")
         except Exception:
@@ -2720,7 +2910,7 @@ class WelearnApp:
                   "settings": ("⚙️  设置", "⚙️  Settings")}
         for key, (zh, en) in labels.items():
             self.nav_buttons[key].configure(text=zh if self.lang == "zh" else en)
-        self.root.title("Welearn 刷课工具 v4.0" if self.lang == "zh" else "Welearn Tool v4.0")
+        self.root.title("Welearn 刷课工具 v4.1" if self.lang == "zh" else "Welearn Tool v4.1")
 
     def _show_disclaimer(self):
         dialog = ctk.CTkToplevel(self.root)
@@ -2737,7 +2927,7 @@ class WelearnApp:
 
         ctk.CTkLabel(dialog, text="Welearn 刷课工具",
                      font=ctk.CTkFont(size=20, weight="bold")).pack(pady=(25, 5))
-        ctk.CTkLabel(dialog, text="v4.0 · 免费开源", text_color="gray").pack(pady=(0, 20))
+        ctk.CTkLabel(dialog, text="v4.1 · 免费开源", text_color="gray").pack(pady=(0, 20))
         ctk.CTkFrame(dialog, height=1, fg_color="gray").pack(fill="x", padx=40, pady=(0, 15))
 
         ctk.CTkLabel(dialog, text="本软件完全免费，仅供学习交流使用。\n\n"
@@ -2842,6 +3032,8 @@ class WelearnApp:
             remaining = total - current
             ratio = current / total if total > 0 else 0
             self.task_progress_bar.set(ratio)
+            if hasattr(self.task_progress_bar, "set_ticks"):
+                self.task_progress_bar.set_ticks(total)
             self.prog_pct.configure(text=f"{int(ratio * 100)}%")
             self._done_count = max(getattr(self, "_done_count", 0), current)
             self._refresh_stat_line()
