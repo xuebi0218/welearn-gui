@@ -6,6 +6,7 @@ v3.2: 新增题目解析和答题记录提交功能。
 v3.3: 修复章节学习时长为0的bug，刷课模式支持多线程并发+真实学习时长。
 v3.4: 修复刷时长模式心跳未触发导致时长不增长的bug。
 v3.5: 修复最后一项卡住问题(join超时类型错误)、停止按钮即时响应(分段sleep+轮询join)、增强日志输出。
+v4.0: 进度区重做（总览卡+每路进度条+结果对账）+ 只刷课模式
 v3.9: 题目解析补全（et-blank 全部 4 种写法）+ 单节上限 + 实时进度
 v3.8: 界面重绘——渐变横幅 + 立绘动效，配色统一为深海色系。
 v3.7: 多路并行（每路独立 Session 各自真实计时，实测 4 路零损耗）+ 并发可调。
@@ -1080,19 +1081,31 @@ def _curriculum_worker(app):
                 return
             crate = random.randint(mycrate[0], mycrate[1]) if randommode else int(mycrate)
             dur = random.randint(duration[0], duration[1]) if random_duration else int(duration)
+            _mode_tag = "只刷课" if getattr(app, "lesson_only", False) else "刷课"
             app.message_queue.put({"type": "log",
-                                   "text": f'{tag_pre}[刷课] {loc} → 正确率 {crate}%，至少学 {dur}s'})
+                                   "text": f'{tag_pre}[{_mode_tag}] {loc} → 正确率 {crate}%，'
+                                           f'至少学 {dur}s'})
             def _cb(info, _loc=loc, _lane=lane_id):
                 app.message_queue.put({"type": "lesson_progress", "lane": _lane,
                                        "loc": _loc, "elapsed": info["elapsed"],
                                        "target": info["target"], "timelitsec": info["timelitsec"]})
 
+            lesson_only = bool(getattr(app, "lesson_only", False))
             r = welearn_curriculum_submit(session, cid, uid, classid, scoid, crate,
                                           learntime=dur, stop_check=lambda: app.stop_requested,
                                           unitidx=unit_i,
-                                          lesson_cap=int(getattr(app, "lesson_cap", 0) or 0),
+                                          adaptive=not lesson_only,
+                                          lesson_cap=(45 if lesson_only
+                                                      else int(getattr(app, "lesson_cap", 0) or 0)),
                                           progress_cb=_cb)
-            app.message_queue.put({"type": "lane_done", "lane": lane_id})
+            app.message_queue.put({"type": "lane_done", "lane": lane_id, "loc": loc,
+                                   "elapsed": r.get("elapsed", 0),
+                                   "target": r.get("target", 0),
+                                   "verified": r.get("verified"),
+                                   "base": r.get("base", 0),
+                                   "capped": r.get("capped", False),
+                                   "way1": r["way1"], "way2": r["way2"],
+                                   "stopped": r["stopped"]})
             if r["stopped"]:
                 with stats_lock:
                     counters["way1_ok" if r["way1"] else "way1_fail"] += 1
@@ -1387,7 +1400,7 @@ class WelearnApp:
         ctk.set_default_color_theme("blue")
 
         self.root = ctk.CTk()
-        self.root.title("Welearn 刷课工具 v3.9")
+        self.root.title("Welearn 刷课工具 v4.0")
         self.root.geometry("1060x700")
         self.root.minsize(960, 640)
 
@@ -1464,26 +1477,115 @@ class WelearnApp:
         self.lesson_cap = 0 if choice == "不设上限" else int(choice.split()[0]) * 60
         self._save_prefs()
 
+    def _refresh_stat_line(self):
+        try:
+            done = int(getattr(self, "_done_count", 0) or 0)
+            running = int(getattr(self, "_running_n", 0) or 0)
+            waiting = max(0, int(getattr(self, "_task_total", 0) or 0) - done - running)
+            self.stat_line.configure(text=f"已完成 {done} · 进行中 {running} · 待处理 {waiting}")
+        except Exception:
+            pass
+
+    def _refresh_scrollregion(self):
+        """CTkScrollableFrame 在子控件后加时不会自动扩高，这里手动重算一次。"""
+        try:
+            self.home_scroll.update_idletasks()
+            canvas = self.home_scroll._parent_canvas
+            bbox = canvas.bbox("all")
+            if bbox:
+                canvas.configure(scrollregion=bbox)
+        except Exception:
+            pass
+
+    def _ensure_lane_row(self, lane_id):
+        """按需创建一路的进度行。"""
+        if lane_id in self.lane_rows:
+            return self.lane_rows[lane_id]
+        if self.lane_empty.winfo_ismapped():
+            self.lane_empty.pack_forget()
+        row = ctk.CTkFrame(self.lane_area, fg_color="transparent", height=26)
+        row.pack(fill="x", pady=1)
+        row.pack_propagate(False)
+        dot = ctk.CTkLabel(row, text="●", width=14, font=ctk.CTkFont(size=11),
+                           text_color=("#94a3b8", "#64748b"))
+        dot.pack(side="left")
+        name = ctk.CTkLabel(row, text=f"L{lane_id + 1}", width=118, anchor="w",
+                            font=ctk.CTkFont(size=11))
+        name.pack(side="left", padx=(2, 6))
+        bar = ctk.CTkProgressBar(row, width=104, height=6, corner_radius=3,
+                                 progress_color=("#4cc9d6", "#5b8def"))
+        bar.pack(side="left")
+        bar.set(0)
+        pct = ctk.CTkLabel(row, text="0%", width=34, font=ctk.CTkFont(size=10),
+                           text_color=("#64748b", "#8aa0c0"))
+        pct.pack(side="left", padx=(6, 0))
+        info = ctk.CTkLabel(row, text="", anchor="w", font=ctk.CTkFont(size=10),
+                            text_color=("#94a3b8", "#5f7396"))
+        info.pack(side="left", padx=(6, 0))
+        self.lane_rows[lane_id] = {"dot": dot, "name": name, "bar": bar, "pct": pct, "info": info}
+        self._refresh_scrollregion()
+        return self.lane_rows[lane_id]
+
     def _render_lanes(self):
-        if not hasattr(self, "lane_box"):
+        """把 _lane_state 画成每路一行：状态点 + 节名 + 进度条 + 已学/目标 + 剩余。"""
+        if not hasattr(self, "lane_rows"):
             return
-        lines = []
-        for i in range(8):
-            st = self._lane_state.get(i)
-            if not st:
-                continue
-            el, tg = st["elapsed"], max(1, st["target"])
+        now = time.time()
+        running = getattr(self, "running", False)
+        stalled = []
+        for lane_id in sorted(self._lane_state.keys()):
+            st = self._lane_state[lane_id]
+            w = self._ensure_lane_row(lane_id)
+            loc = (st.get("loc") or "?")
+            loc_short = loc if len(loc) <= 18 else loc[:17] + "…"
+            el = int(st.get("elapsed") or 0)
+            tg = max(1, int(st.get("target") or 1))
             pct = min(100, int(el * 100 / tg))
-            bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
+            w["name"].configure(text=f"L{lane_id + 1}  {loc_short}")
+            w["bar"].set(pct / 100.0)
+            w["pct"].configure(text=f"{pct}%")
+            if st.get("done"):
+                w["dot"].configure(text_color=("#16a34a", "#4ade80"))
+                w["info"].configure(text="已完成")
+                continue
+            idle = now - float(st.get("ts") or now)
             eta = max(0, tg - el)
-            lines.append(f"L{i + 1} {st['loc'][:38]:<38} {bar} {pct:3d}%  "
-                         f"{el // 60:02d}:{el % 60:02d}/{tg // 60:02d}:{tg % 60:02d}  剩{eta // 60}分")
-        if not lines:
-            lines = ["（未开始）"]
-        self.lane_box.configure(state="normal")
-        self.lane_box.delete("1.0", "end")
-        self.lane_box.insert("1.0", "\n".join(lines))
-        self.lane_box.configure(state="disabled")
+            clock = f"{el // 60:02d}:{el % 60:02d}/{tg // 60:02d}:{tg % 60:02d}"
+            if running and idle > 120:
+                w["dot"].configure(text="◆", text_color=("#b45309", "#f0a35e"))
+                w["info"].configure(text=f"疑似中断 {int(idle)}s")
+                stalled.append(f"L{lane_id + 1}")
+            elif running and idle > 45:
+                w["dot"].configure(text="◆", text_color=("#d97706", "#fbbf24"))
+                w["info"].configure(text=f"心跳超时 {int(idle)}s")
+                stalled.append(f"L{lane_id + 1}")
+            elif running and idle > 32:
+                w["dot"].configure(text="◐", text_color=("#5b8def", "#7fa2f0"))
+                w["info"].configure(text=f"{clock} 等待心跳 {int(35 - idle)}s")
+            else:
+                w["dot"].configure(text="●", text_color=("#4cc9d6", "#5b8def"))
+                w["info"].configure(text=clock)
+
+        if stalled:
+            self.stall_label.configure(
+                text=f"{'、'.join(stalled)} 45 秒无心跳 · 超过 2 分钟可停止重试该节")
+        else:
+            self.stall_label.configure(text="")
+
+        n_lane = len(self._lane_state)
+        self._running_n = sum(1 for v in self._lane_state.values() if not v.get("done"))
+        self._refresh_stat_line()
+        if n_lane == 0 and not self.lane_empty.winfo_ismapped():
+            self.lane_empty.pack(anchor="w", pady=(2, 6))
+
+    def _tick_progress(self):
+        """每 2 秒刷新一次状态点与停留时长（只在运行时有意义）。"""
+        try:
+            if getattr(self, "running", False):
+                self._render_lanes()
+                self.root.after(2000, self._tick_progress)
+        except Exception:
+            pass
 
     def _tick_mascot(self):
         """idle 动效：6 帧循环，运行中稍快一点（像在陪你干活）。"""
@@ -1581,7 +1683,7 @@ class WelearnApp:
         bottom_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         bottom_frame.pack(side="bottom", fill="x", padx=15, pady=(4, 10))
         ctk.CTkFrame(bottom_frame, height=1, fg_color=("#30363d", "#21262d")).pack(fill="x", pady=(0, 6))
-        ctk.CTkLabel(bottom_frame, text="v3.9 · 免费开源",
+        ctk.CTkLabel(bottom_frame, text="v4.0 · 免费开源",
                      font=ctk.CTkFont(size=9),
                      text_color=("#484f58", "#484f58")).pack(anchor="w")
 
@@ -1620,6 +1722,7 @@ class WelearnApp:
 
         # ── 顶部标题 + 渐变条 ──
         hero = ctk.CTkFrame(self.home_scroll, corner_radius=0, fg_color="transparent")
+        self.hero_frame = hero
         hero.pack(fill="x", padx=12, pady=(10, 2))
         try:
             self._strip_src = Image.open(_asset("strip.png")).convert("RGB")
@@ -1769,6 +1872,9 @@ class WelearnApp:
         ctk.CTkRadioButton(mode_row, text="📝 刷课并计时（解析题目+答题记录+学习时长）",
                            variable=self.task_mode_var, value="curriculum",
                            command=self._on_task_mode_change).pack(anchor="w", pady=2)
+        ctk.CTkRadioButton(mode_row, text="🎯 只刷课（只做题+答题记录，不补时长）",
+                           variable=self.task_mode_var, value="lessononly",
+                           command=self._on_task_mode_change).pack(anchor="w", pady=2)
         ctk.CTkRadioButton(mode_row, text="⏱ 仅刷时长（心跳保活，不操作题目）",
                            variable=self.task_mode_var, value="timeonly",
                            command=self._on_task_mode_change).pack(anchor="w", pady=2)
@@ -1810,12 +1916,13 @@ class WelearnApp:
         ctk.CTkFrame(self.task_frame, height=1, fg_color=("#e2e8f0", "#334155")).pack(fill="x", padx=15, pady=(6, 0))
 
         shared_panel = ctk.CTkFrame(self.task_frame, fg_color="transparent")
+        self.shared_panel = shared_panel
         shared_panel.pack(fill="x", padx=15, pady=(10, 5))
         ctk.CTkLabel(shared_panel, text="时长与并发设置",
                      font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", pady=(0, 8))
 
         ctk.CTkLabel(shared_panel,
-                     text="课时时长 = 下限，不足部分由平台要求（timelitsec）自动补齐；上限 1500s。",
+                     text="课时时长 = 下限，不足部分按平台要求自动补齐（上限 1500s）",
                      font=ctk.CTkFont(size=10), text_color=("#64748b", "#7c8db5")
                      ).pack(anchor="w", pady=(0, 6))
 
@@ -1849,7 +1956,19 @@ class WelearnApp:
         self.threads_entry = ctk.CTkEntry(thread_row, width=55, placeholder_text="4")
         self.threads_entry.pack(side="left", padx=5)
         self.threads_entry.insert(0, "4")
-        ctk.CTkLabel(thread_row, text="（每路各自真实计时：实测 4 路各 +61s/86s 无损耗；建议 3~4，上限 8）",
+        ctk.CTkLabel(thread_row, text="（每路独立计时，实测 4 路零损耗；建议 3~4）",
+                     font=ctk.CTkFont(size=10), text_color=("#64748b", "#7c8db5")).pack(side="left")
+
+        cap_row = ctk.CTkFrame(shared_panel, fg_color="transparent")
+        cap_row.pack(fill="x", pady=(8, 0))
+        ctk.CTkLabel(cap_row, text="单节上限:", font=ctk.CTkFont(size=11)).pack(side="left")
+        self.cap_menu = ctk.CTkOptionMenu(cap_row, values=["10 分钟", "15 分钟", "20 分钟", "30 分钟", "不设上限"],
+                                          width=110, height=26, font=ctk.CTkFont(size=11),
+                                          command=self._on_cap_change)
+        self.cap_menu.pack(side="left", padx=6)
+        _cap = int(getattr(self, "lesson_cap", 1200) or 0)
+        self.cap_menu.set(f"{_cap // 60} 分钟" if _cap else "不设上限")
+        ctk.CTkLabel(cap_row, text="（超限就停，下次接着补）",
                      font=ctk.CTkFont(size=10), text_color=("#64748b", "#7c8db5")).pack(side="left")
 
         # ── 开始按钮 + 进度 ──
@@ -1863,41 +1982,93 @@ class WelearnApp:
                                             command=self._on_start_task)
         self.btn_start_task.pack(side="left")
 
-        # 进度条 + 统计
-        progress_frame = ctk.CTkFrame(self.task_frame, fg_color="transparent")
-        progress_frame.pack(fill="x", padx=15, pady=(0, 10))
-        self.task_progress_label = ctk.CTkLabel(progress_frame, text="进度: -/-", font=ctk.CTkFont(size=12))
-        self.task_progress_label.pack(anchor="w")
-        self.task_progress_bar = ctk.CTkProgressBar(progress_frame, width=500,
-                                                    height=8, corner_radius=4,
+        # ── 运行状态卡片 ──
+        progress_frame = ctk.CTkFrame(self.task_frame, corner_radius=12,
+                                      fg_color=("#ffffff", "#0d1626"),
+                                      border_width=1, border_color=("#e2e8f0", "#1b2740"))
+        progress_frame.pack(fill="x", padx=15, pady=(10, 10))
+        self.prog_frame = progress_frame
+
+        head = ctk.CTkFrame(progress_frame, fg_color="transparent")
+        head.pack(fill="x", padx=14, pady=(12, 0))
+        ctk.CTkLabel(head, text="运行状态", font=ctk.CTkFont(size=13, weight="bold")
+                     ).pack(side="left")
+        self.prog_badge = ctk.CTkLabel(head, text="空闲", font=ctk.CTkFont(size=11),
+                                       text_color=("#64748b", "#8aa0c0"),
+                                       fg_color=("#f1f5f9", "#16233a"), corner_radius=9,
+                                       padx=9, pady=2)
+        self.prog_badge.pack(side="right")
+
+        # 总进度：大百分比 + ETA
+        total_row = ctk.CTkFrame(progress_frame, fg_color="transparent")
+        total_row.pack(fill="x", padx=14, pady=(8, 0))
+        self.prog_pct = ctk.CTkLabel(total_row, text="0%", font=ctk.CTkFont(size=26, weight="bold"),
+                                     text_color=("#1b2a4a", "#e9f1ff"))
+        self.prog_pct.pack(side="left")
+        self.task_progress_label = ctk.CTkLabel(total_row, text="尚未开始",
+                                                font=ctk.CTkFont(size=11),
+                                                text_color=("#64748b", "#8aa0c0"))
+        self.task_progress_label.pack(side="left", padx=(10, 0), pady=(8, 0))
+        self.eta_label = ctk.CTkLabel(total_row, text="", font=ctk.CTkFont(size=11),
+                                      text_color=("#64748b", "#8aa0c0"))
+        self.eta_label.pack(side="right", pady=(8, 0))
+
+        self.task_progress_bar = ctk.CTkProgressBar(progress_frame, height=10, corner_radius=5,
                                                     progress_color=("#4cc9d6", "#5b8def"))
-        self.task_progress_bar.pack(fill="x", pady=(3, 3))
+        self.task_progress_bar.pack(fill="x", padx=14, pady=(4, 8))
         self.task_progress_bar.set(0)
-        self.task_stats_label = ctk.CTkLabel(progress_frame, text="", font=ctk.CTkFont(size=11),
-                                              text_color=("#64748b", "#94a3b8"))
-        self.task_stats_label.pack(anchor="w")
 
-        # 每路实时状态（最多 8 行）
-        self.lane_box = ctk.CTkTextbox(progress_frame, height=88, font=ctk.CTkFont(size=11),
-                                       fg_color=("#f8fafc", "#0b1220"),
-                                       text_color=("#334155", "#c9d6ea"),
-                                       border_width=1, border_color=("#e2e8f0", "#1b2740"))
-        self.lane_box.pack(fill="x", pady=(6, 0))
-        self.lane_box.configure(state="disabled")
+        # 统计行（单行文本，避免窄窗口下被裁）
+        self.stat_line = ctk.CTkLabel(progress_frame, text="已完成 0 · 进行中 0 · 待处理 0",
+                                      font=ctk.CTkFont(size=11),
+                                      text_color=("#5b7099", "#8aa4c8"))
+        self.stat_line.pack(anchor="w", padx=14, pady=(0, 8))
+        self.stat_labels = {}
+
+        # 结束后的对账卡（默认隐藏）
+        self.result_card = ctk.CTkFrame(progress_frame, corner_radius=10,
+                                        fg_color=("#eef6fb", "#0f2434"))
+        self.result_title = ctk.CTkLabel(self.result_card, text="本次运行完成",
+                                         font=ctk.CTkFont(size=12, weight="bold"),
+                                         text_color=("#1b2a4a", "#e9f1ff"))
+        self.result_title.pack(anchor="w", padx=12, pady=(10, 0))
+        self.result_big = ctk.CTkLabel(self.result_card, text="00:00",
+                                       font=ctk.CTkFont(size=30, weight="bold"),
+                                       text_color=("#0e7490", "#5bd3e3"))
+        self.result_big.pack(anchor="w", padx=12)
+        ctk.CTkLabel(self.result_card, text="本次入账时长（按服务端回读）",
+                     font=ctk.CTkFont(size=10),
+                     text_color=("#64748b", "#7f93b3")).pack(anchor="w", padx=13)
+        self.result_sub = ctk.CTkLabel(self.result_card, text="",
+                                       font=ctk.CTkFont(size=11),
+                                       text_color=("#334155", "#c9d6ea"))
+        self.result_sub.pack(anchor="w", padx=12, pady=(6, 0))
+        self.result_hint = ctk.CTkLabel(self.result_card, text="",
+                                        font=ctk.CTkFont(size=10),
+                                        text_color=("#64748b", "#8aa0c0"))
+        self.result_hint.pack(anchor="w", padx=12, pady=(2, 10))
+
+        # 每路一行（真进度条，最多 8 行）
+        self.lane_area = ctk.CTkFrame(progress_frame, fg_color="transparent")
+        self.lane_area.pack(fill="x", padx=14, pady=(0, 4))
+        self.lane_rows = {}
+        self.lane_empty = ctk.CTkLabel(self.lane_area, text="开始后这里会显示每一路的学习进度",
+                                       font=ctk.CTkFont(size=11),
+                                       text_color=("#94a3b8", "#5f7396"))
+        self.lane_empty.pack(anchor="w", pady=(2, 6))
+
+        self.stall_label = ctk.CTkLabel(progress_frame, text="", font=ctk.CTkFont(size=11),
+                                        text_color=("#b45309", "#e0b070"))
+        self.stall_label.pack(anchor="w", padx=14, pady=(0, 10))
+
+        self.task_stats_label = ctk.CTkLabel(progress_frame, text="", font=ctk.CTkFont(size=10),
+                                             text_color=("#94a3b8", "#5f7396"))
+        self.task_stats_label.pack(anchor="w", padx=14, pady=(0, 10))
         self._lane_state = {}
+        self._task_total = 0
+        self._task_done = 0
 
-        # 单节上限
-        cap_row = ctk.CTkFrame(progress_frame, fg_color="transparent")
-        cap_row.pack(fill="x", pady=(6, 0))
-        ctk.CTkLabel(cap_row, text="单节上限:", font=ctk.CTkFont(size=11)).pack(side="left")
-        self.cap_menu = ctk.CTkOptionMenu(cap_row, values=["10 分钟", "15 分钟", "20 分钟", "30 分钟", "不设上限"],
-                                          width=110, height=26, font=ctk.CTkFont(size=11),
-                                          command=self._on_cap_change)
-        self.cap_menu.pack(side="left", padx=6)
-        _cap = int(getattr(self, "lesson_cap", 1200) or 0)
-        self.cap_menu.set(f"{_cap // 60} 分钟" if _cap else "不设上限")
-        ctk.CTkLabel(cap_row, text="（平台要求 30 分钟时，超限就下次再补，更像真人）",
-                     font=ctk.CTkFont(size=10), text_color=("#64748b", "#7c8db5")).pack(side="left")
+        self.root.after(200, self._refresh_scrollregion)
 
         # 恢复上次使用的节奏预设
         saved_preset = (self._config or {}).get("preset")
@@ -1984,9 +2155,13 @@ class WelearnApp:
 
     def _on_task_mode_change(self):
         """切换任务模式时显示/隐藏正确率面板"""
-        if self.task_mode_var.get() == "curriculum":
-            self.rate_panel.pack(fill="x", padx=15, pady=(6, 0),
-                                before=self.task_frame.winfo_children()[-4])
+        mode = self.task_mode_var.get()
+        if mode in ("curriculum", "lessononly"):
+            target = getattr(self, "shared_panel", None)
+            if target is not None:
+                self.rate_panel.pack(fill="x", padx=15, pady=(6, 0), before=target)
+            else:
+                self.rate_panel.pack(fill="x", padx=15, pady=(6, 0))
         else:
             self.rate_panel.pack_forget()
 
@@ -2443,19 +2618,44 @@ class WelearnApp:
 
         self._log("─" * 55)
         self.stop_requested = False
+        self._earned_sec = 0
+        self._done_count = 0
+        self._ok_count = 0
+        self._fail_count = 0
+        self._fail_list = []
+        if hasattr(self, "result_card") and self.result_card.winfo_ismapped():
+            self.result_card.pack_forget()
+        if hasattr(self, "prog_badge"):
+            self.prog_badge.configure(text="运行中", text_color=("#0e7490", "#5bd3e3"))
+        if hasattr(self, "prog_pct"):
+            self.prog_pct.configure(text="0%")
+        self.root.after(300, self._scroll_to_progress)
+        self.root.after(2000, self._tick_progress)
+        self.lesson_only = (mode == "lessononly")
+        if self.lesson_only:
+            # 只刷课：不补时长，只给到"平台肯收"的最小在线时间
+            self.curriculum_duration = [30, 45]
         self.task_progress_bar.set(0)
         if hasattr(self, "_lane_state"):
             self._lane_state.clear()
             self._render_lanes()
         self.task_stats_label.configure(text="")
 
-        if mode == "curriculum":
+        if mode in ("curriculum", "lessononly"):
             dur = self.curriculum_duration
             dur_str = f"{dur}s" if isinstance(dur, int) else f"{dur[0]}~{dur[1]}s"
             rate = self.curriculum_rate
             rate_str = f"{rate}%" if isinstance(rate, int) else f"{rate[0]}~{rate[1]}%"
-            self._log(f"📝 刷课并计时 | 正确率={rate_str} | 时长={dur_str} | 线程={max_threads}", "log_warning")
-            self._set_running(True, "刷课进行中...")
+            if self.lesson_only:
+                self._log(f"🎯 只刷课 | 正确率={rate_str} | 每题在线 {dur_str} | 线程={max_threads}",
+                          "log_warning")
+                self._log("   只写答题记录与完成进度，不补平台要求的学时；"
+                          "后续要学时请再跑「刷课并计时」补齐", "log_warning")
+                self._set_running(True, "只刷课进行中...")
+            else:
+                self._log(f"📝 刷课并计时 | 正确率={rate_str} | 时长={dur_str} | 线程={max_threads}",
+                          "log_warning")
+                self._set_running(True, "刷课进行中...")
             threading.Thread(target=thread_curriculum_execute, args=(self,), daemon=True).start()
         else:
             dur = self.time_duration
@@ -2475,7 +2675,8 @@ class WelearnApp:
         self.stop_requested = True
         self.btn_stop.configure(state="disabled", text="⏳ 停止中...")
         self.status_label.configure(text="正在停止...", text_color="orange")
-        mode = "刷课" if self.task_mode_var.get() == "curriculum" else "刷时长"
+        _m = self.task_mode_var.get()
+        mode = {"curriculum": "刷课", "lessononly": "只刷课", "timeonly": "刷时长"}.get(_m, "任务")
         self._log(f"[!] ⏹ 用户请求停止{mode}任务，正在等待当前操作完成...", "log_warning")
         self._log("[!] 提示：正在 sleep 的线程需要等待当前分段结束（最多5秒）", "log_warning")
 
@@ -2505,7 +2706,7 @@ class WelearnApp:
                 timeout=10)
             if resp.status_code == 200:
                 latest = resp.json()["tag_name"]
-                self._log(f"最新版本: {latest}，当前: v3.9")
+                self._log(f"最新版本: {latest}，当前: v4.0")
             else:
                 self._log("GitHub 仓库尚未设置，无法检查更新", "log_warning")
         except Exception:
@@ -2519,7 +2720,7 @@ class WelearnApp:
                   "settings": ("⚙️  设置", "⚙️  Settings")}
         for key, (zh, en) in labels.items():
             self.nav_buttons[key].configure(text=zh if self.lang == "zh" else en)
-        self.root.title("Welearn 刷课工具 v3.9" if self.lang == "zh" else "Welearn Tool v3.9")
+        self.root.title("Welearn 刷课工具 v4.0" if self.lang == "zh" else "Welearn Tool v4.0")
 
     def _show_disclaimer(self):
         dialog = ctk.CTkToplevel(self.root)
@@ -2536,7 +2737,7 @@ class WelearnApp:
 
         ctk.CTkLabel(dialog, text="Welearn 刷课工具",
                      font=ctk.CTkFont(size=20, weight="bold")).pack(pady=(25, 5))
-        ctk.CTkLabel(dialog, text="v3.9 · 免费开源", text_color="gray").pack(pady=(0, 20))
+        ctk.CTkLabel(dialog, text="v4.0 · 免费开源", text_color="gray").pack(pady=(0, 20))
         ctk.CTkFrame(dialog, height=1, fg_color="gray").pack(fill="x", padx=40, pady=(0, 15))
 
         ctk.CTkLabel(dialog, text="本软件完全免费，仅供学习交流使用。\n\n"
@@ -2604,16 +2805,46 @@ class WelearnApp:
             self._log(f"获取单元成功，共 {len(self.units)} 个单元")
         elif t == "lesson_progress":
             self._lane_state[msg["lane"]] = {"loc": msg["loc"], "elapsed": msg["elapsed"],
-                                             "target": msg["target"]}
+                                             "target": msg["target"], "ts": time.time()}
             self._render_lanes()
         elif t == "lane_done":
-            self._lane_state.pop(msg["lane"], None)
-            self._render_lanes()
+            lane = msg["lane"]
+            gain = 0
+            try:
+                if msg.get("verified") is not None and msg.get("base") is not None:
+                    gain = max(0, int(msg["verified"]) - int(msg.get("base") or 0))
+                else:
+                    gain = int(msg.get("elapsed") or 0)
+            except Exception:
+                gain = 0
+            self._earned_sec = getattr(self, "_earned_sec", 0) + gain
+            self._done_count = getattr(self, "_done_count", 0) + 1
+            if msg.get("way1") and msg.get("way2"):
+                self._ok_count = getattr(self, "_ok_count", 0) + 1
+            else:
+                self._fail_count = getattr(self, "_fail_count", 0) + 1
+                self._fail_list = getattr(self, "_fail_list", [])
+                if msg.get("loc"):
+                    self._fail_list.append(msg["loc"])
+            st = self._lane_state.get(lane)
+            if st:
+                st["done"] = True
+                st["ts"] = time.time()
+                w = self.lane_rows.get(lane)
+                if w:
+                    w["dot"].configure(text="●", text_color=("#16a34a", "#4ade80"))
+                    w["bar"].set(1.0)
+                    w["pct"].configure(text="100%")
+                    w["info"].configure(text=f"完成 计入{gain}s")
+            self._refresh_stat_line()
         elif t == "progress":
             current, total = msg["current"], msg["total"]
             remaining = total - current
             ratio = current / total if total > 0 else 0
             self.task_progress_bar.set(ratio)
+            self.prog_pct.configure(text=f"{int(ratio * 100)}%")
+            self._done_count = max(getattr(self, "_done_count", 0), current)
+            self._refresh_stat_line()
             if ratio >= 1.0:
                 self.task_progress_label.configure(text=f"✅ 全部完成！共 {total} 个课时已处理", text_color="#27ae60")
             elif ratio > 0:
@@ -2626,6 +2857,7 @@ class WelearnApp:
             else:
                 self.task_progress_label.configure(text=f"📊 进度: {current}/{total} | 待处理 {remaining} 个")
         elif t == "curriculum_complete":
+            self._show_result_card(msg)
             total = msg['way1_ok'] + msg['way1_fail']
             self.task_stats_label.configure(
                 text=f"共 {total} 节 | 方式1 成功:{msg['way1_ok']} 失败:{msg['way1_fail']} | "
@@ -2648,6 +2880,58 @@ class WelearnApp:
                 self._log("─" * 55)
                 self._log(f"🎉 刷时长全部完成！错误 {msg['errors']} 个", "log_success")
             self._set_running(False, "就绪")
+
+    def _scroll_to_progress(self):
+        """开始后自动滚到进度区，不用用户自己找。
+
+        布局在头几秒还会因为图片/字体度量再算一次，会把滚动位置顶回去，
+        所以这里连续校正几次，而不是只 moveto 一次。
+        """
+        def _jump(_attempt=0):
+            try:
+                self._refresh_scrollregion()
+                self.home_scroll._parent_canvas.yview_moveto(1.0)
+            except Exception:
+                return
+            if _attempt < 3:
+                self.root.after(500, lambda: _jump(_attempt + 1))
+
+        _jump()
+
+    def _show_result_card(self, msg):
+        """运行结束后的对账卡片：本次入账多少、成了几节、失败在哪。"""
+        try:
+            earned = int(getattr(self, "_earned_sec", 0))
+            done_n = int(getattr(self, "_done_count", 0))
+            ok_n = int(getattr(self, "_ok_count", 0))
+            fail_n = int(getattr(self, "_fail_count", 0))
+            fails = getattr(self, "_fail_list", [])
+            stopped = bool(msg.get("stopped"))
+
+            self.result_card.pack(fill="x", padx=14, pady=(0, 10), before=self.lane_area)
+            self._refresh_scrollregion()
+            title = "本次运行已停止" if stopped else "本次运行完成"
+            self.result_title.configure(text=title)
+            mm, ss = divmod(earned, 60)
+            self.result_big.configure(text=f"{mm:02d}:{ss:02d}")
+            self.result_sub.configure(
+                text=f"{done_n} 节 · 成功 {ok_n} · 失败 {fail_n}"
+                     + (f" · 平均 {earned // max(1, done_n)}s/节" if done_n else ""))
+            if fails:
+                names = "、".join(f[:18] for f in fails[:3])
+                more = "" if len(fails) <= 3 else f" 等 {len(fails)} 节"
+                self.result_hint.configure(text=f"未完成：{names}{more}｜可单独重跑这几节")
+            elif done_n:
+                self.result_hint.configure(text="时长已回读校验，日志里可逐节核对")
+            else:
+                self.result_hint.configure(text="本次没有产生提交")
+            self.prog_badge.configure(text="已停止" if stopped else "已完成",
+                                      text_color=("#b45309", "#e0b070"))
+        except Exception as e:
+            try:
+                self._log(f"[界面] 结果卡渲染异常: {e}", "log_error")
+            except Exception:
+                pass
 
     def _populate_course_menu(self):
         values = [f'{c["per"]:>3}% {c["name"]}' for c in self.courses]
