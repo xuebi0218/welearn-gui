@@ -42,3 +42,6 @@ err.log
 out.log
 项目结构总览.html
 *.log
+tools/cookie.txt
+tools/*.txt
+!tools/README.md

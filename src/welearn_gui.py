@@ -6,6 +6,7 @@ v3.2: 新增题目解析和答题记录提交功能。
 v3.3: 修复章节学习时长为0的bug，刷课模式支持多线程并发+真实学习时长。
 v3.4: 修复刷时长模式心跳未触发导致时长不增长的bug。
 v3.5: 修复最后一项卡住问题(join超时类型错误)、停止按钮即时响应(分段sleep+轮询join)、增强日志输出。
+v3.9: 题目解析补全（et-blank 全部 4 种写法）+ 单节上限 + 实时进度
 v3.8: 界面重绘——渐变横幅 + 立绘动效，配色统一为深海色系。
 v3.7: 多路并行（每路独立 Session 各自真实计时，实测 4 路零损耗）+ 并发可调。
 v3.6: 按平台协议重写核心——自适应补齐课时时长、边学边心跳、提交后回读校验、
@@ -475,7 +476,7 @@ def welearn_verify_learntime(session, cid, uid, classid, unitidx, scoid):
 
 def welearn_curriculum_submit(session, cid, uid, classid, scoid, crate, learntime=0,
                               stop_check=None, unitidx=0, adaptive=True,
-                              duration_cap=DURATION_CAP):
+                              duration_cap=DURATION_CAP, lesson_cap=0, progress_cb=None):
     """
     刷课模式：完成一个小节。
     流程：解析题目 → startsco160928（读 timelitsec/useSeconds）→ 边等边心跳 → setscoinfo
@@ -490,7 +491,7 @@ def welearn_curriculum_submit(session, cid, uid, classid, scoid, crate, learntim
                f"?cid={cid}&classid={classid}&sco={scoid}")
     result = {"way1": False, "way2": False, "questions": 0, "target": int(learntime or 0),
               "timelitsec": 0, "verified": None, "stopped": False, "note": "",
-              "reached": False}
+              "reached": False, "elapsed": 0, "learned_total": 0, "capped": False}
 
     # ── 0. 解析课件题目（失败不阻塞）──
     questions = []
@@ -522,6 +523,10 @@ def welearn_curriculum_submit(session, cid, uid, classid, scoid, crate, learntim
         deficit = max(0, req["timelitsec"] - req["use_seconds"])
         if deficit > target:
             target = deficit
+    # 单节上限：平台要 30 分钟也不要一口气跑完，超限就分段补（更接近真人节奏）
+    if lesson_cap and target > lesson_cap:
+        target = int(lesson_cap)
+        result["capped"] = True
     target = _clamp(target, 0, duration_cap if duration_cap else DURATION_CAP)
     result["target"] = target
 
@@ -547,6 +552,13 @@ def welearn_curriculum_submit(session, cid, uid, classid, scoid, crate, learntim
                                    timelitsec=timer_target,
                                    endcaltime="true" if reached else "false")
             next_hb = elapsed + random.randint(HEARTBEAT_MIN, HEARTBEAT_MAX)
+            if progress_cb:
+                try:
+                    progress_cb({"elapsed": int(elapsed), "target": int(target),
+                                 "timelitsec": timer_target, "base": base_total,
+                                 "reached": reached})
+                except Exception:
+                    pass
 
     if stop_check and stop_check():
         result["stopped"] = True
@@ -570,6 +582,8 @@ def welearn_curriculum_submit(session, cid, uid, classid, scoid, crate, learntim
         reached_final = target == 0 or elapsed >= target * 0.95
         progress_val = 1.0 if reached_final else 0.5
     result["reached"] = reached_final
+    result["elapsed"] = int(elapsed)
+    result["learned_total"] = learned_total
 
     cstatus_val = "completed" if reached_final else "incomplete"
     progress_str = f"{progress_val:.2f}"
@@ -815,6 +829,11 @@ def _fetch_sco_template(session, template_url):
                            timeout=15)
         if resp.status_code != 200:
             return None
+        # 课件模板是 UTF-8，requests 常按 ISO-8859-1 猜，会把撇号/引号解成乱码
+        if not resp.encoding or resp.encoding.lower() in ("iso-8859-1", "ascii"):
+            resp.encoding = resp.apparent_encoding or "utf-8"
+            if (resp.encoding or "").lower() in ("iso-8859-1", "ascii"):
+                resp.encoding = "utf-8"
         return resp.text
     except Exception:
         return None
@@ -828,21 +847,31 @@ def parse_sco_questions(html):
     """
     questions = []
 
-    # ── 填空: <et-blank g>答案</et-blank> ──
-    for m in re.finditer(r'<et-blank\s+g>(.*?)</et-blank>', html, re.DOTALL):
-        answer = m.group(1).strip()
-        answer = re.sub(r'<[^>]+>', '', answer)
+    # ── 填空：<et-blank ...>答案</et-blank> ──
+    # 平台有四种写法：g / g notscored / noinput g / notscored multiline ... g
+    # 旧版只认 "<et-blank g>"，把 40/89 的填空（含 notscored）全漏掉了。
+    for m in re.finditer(r'<et-blank([^>]*)>(.*?)</et-blank>', html, re.DOTALL):
+        attrs, body = m.group(1), m.group(2)
+        if 'noinput' in attrs:
+            continue
+        answer = re.sub(r'<[^>]+>', '', body)
         answer = unescape(answer).strip()
-        if answer:
-            questions.append({'type': 'blank', 'answer': answer})
+        if not answer:
+            continue
+        questions.append({'type': 'blank', 'answer': answer,
+                          'scored': 'notscored' not in attrs})
 
     # ── 判断: <et-tof key="t|f"> ──
     for m in re.finditer(r'<et-tof\s+key="([tf])"', html, re.DOTALL):
-        questions.append({'type': 'tof', 'answer': m.group(1)})
+        questions.append({'type': 'tof', 'answer': m.group(1), 'scored': True})
 
     # ── 选择: <et-choice key="..."> ──
     for m in re.finditer(r'<et-choice[^>]*key="([^"]*)"', html, re.DOTALL):
-        questions.append({'type': 'choice', 'answer': m.group(1)})
+        questions.append({'type': 'choice', 'answer': m.group(1), 'scored': True})
+
+    # ── 开关/排序类: <et-select key="..."> ──
+    for m in re.finditer(r'<et-select[^>]*key="([^"]*)"', html, re.DOTALL):
+        questions.append({'type': 'choice', 'answer': m.group(1), 'scored': True})
 
     return questions
 
@@ -857,7 +886,8 @@ def generate_interactions(questions, crate):
     interactions_info_parts = []
 
     for i, q in enumerate(questions):
-        is_correct = random.random() * 100 < crate
+        scored = q.get('scored', True)
+        is_correct = scored and random.random() * 100 < crate
 
         if q['type'] == 'blank':
             learner_response = q['answer'] if is_correct else 'wrong_answer_' + str(i)
@@ -871,6 +901,9 @@ def generate_interactions(questions, crate):
             result = 'correct' if is_correct else 'wrong'
         else:
             continue
+        if not scored:
+            learner_response = q['answer']
+            result = 'neutral'
 
         # SCORM interactions 对象
         scorm_obj = {
@@ -880,7 +913,7 @@ def generate_interactions(questions, crate):
             'result': result,
             'weighting': '1',
         }
-        if is_correct:
+        if is_correct or not scored:
             scorm_obj['correct_responses'] = [{'pattern': q['answer']}]
         interactions_json.append(scorm_obj)
 
@@ -1012,8 +1045,12 @@ def _curriculum_worker(app):
         else f"{duration}s（自动补齐不足部分）"
     app.message_queue.put({"type": "log_warning",
                            "text": f"📝 待完成 {total} 个小节 | 基准时长 {dur_label} | 并发 {max_threads}"})
+    _cap = int(getattr(app, "lesson_cap", 0) or 0)
+    cap_txt = (f"单节最多 {_cap // 60} 分钟" if _cap else "单节不设上限")
     app.message_queue.put({"type": "log",
-                           "text": "ℹ️ 每个小节的时长按平台要求（timelitsec）自动补齐，实际耗时取决于课件要求。"})
+                           "text": f"ℹ️ 每节先查平台要求（多数 1800s＝30 分钟），按缺口补齐；{cap_txt}。"})
+    app.message_queue.put({"type": "log",
+                           "text": "ℹ️ 运行中每一路都会实时显示「已学/目标」，长时间没变化才说明卡住。"})
 
     # 单日上限：只处理前面 N 个（其余留到下次）
     daily_cap = int(getattr(app, 'daily_lesson_cap', 24) or 24)
@@ -1045,12 +1082,25 @@ def _curriculum_worker(app):
             dur = random.randint(duration[0], duration[1]) if random_duration else int(duration)
             app.message_queue.put({"type": "log",
                                    "text": f'{tag_pre}[刷课] {loc} → 正确率 {crate}%，至少学 {dur}s'})
+            def _cb(info, _loc=loc, _lane=lane_id):
+                app.message_queue.put({"type": "lesson_progress", "lane": _lane,
+                                       "loc": _loc, "elapsed": info["elapsed"],
+                                       "target": info["target"], "timelitsec": info["timelitsec"]})
+
             r = welearn_curriculum_submit(session, cid, uid, classid, scoid, crate,
                                           learntime=dur, stop_check=lambda: app.stop_requested,
-                                          unitidx=unit_i)
+                                          unitidx=unit_i,
+                                          lesson_cap=int(getattr(app, "lesson_cap", 0) or 0),
+                                          progress_cb=_cb)
+            app.message_queue.put({"type": "lane_done", "lane": lane_id})
             if r["stopped"]:
+                with stats_lock:
+                    counters["way1_ok" if r["way1"] else "way1_fail"] += 1
+                    counters["way2_ok" if r["way2"] else "way2_fail"] += 1
+                    counters["stopped"] = counters.get("stopped", 0) + 1
                 app.message_queue.put({"type": "log_warning",
-                                       "text": f'  ⏹ {loc} 已停止（已学 {r["target"]}s 已落库）'})
+                                       "text": f'  ⏹ {loc} 已停止（本次 {r["elapsed"]}s，'
+                                               f'回读 {r["verified"] if r["verified"] is not None else "?"}s）'})
                 return
             with stats_lock:
                 counters["way1_ok" if r["way1"] else "way1_fail"] += 1
@@ -1337,7 +1387,7 @@ class WelearnApp:
         ctk.set_default_color_theme("blue")
 
         self.root = ctk.CTk()
-        self.root.title("Welearn 刷课工具 v3.8")
+        self.root.title("Welearn 刷课工具 v3.9")
         self.root.geometry("1060x700")
         self.root.minsize(960, 640)
 
@@ -1380,6 +1430,7 @@ class WelearnApp:
         self.daily_lesson_cap = 24
         self.cooldown_every = 4
         self.cooldown_range = (400, 900)
+        self.lesson_cap = 1200           # 单节最多学多久（秒），0=不设上限
 
         self._build_sidebar()
         self._build_content()
@@ -1401,12 +1452,38 @@ class WelearnApp:
         try:
             self._config["preset"] = self.risk_preset
             self._config["daily_cap"] = self.daily_lesson_cap
+            self._config["lesson_cap"] = self.lesson_cap
             self._config["rate"] = list(self.curriculum_rate) if isinstance(self.curriculum_rate, list) \
                 else self.curriculum_rate
             self._config["ratio_random"] = self.curriculum_random
         except Exception:
             pass
         _save_config(self._config)
+
+    def _on_cap_change(self, choice):
+        self.lesson_cap = 0 if choice == "不设上限" else int(choice.split()[0]) * 60
+        self._save_prefs()
+
+    def _render_lanes(self):
+        if not hasattr(self, "lane_box"):
+            return
+        lines = []
+        for i in range(8):
+            st = self._lane_state.get(i)
+            if not st:
+                continue
+            el, tg = st["elapsed"], max(1, st["target"])
+            pct = min(100, int(el * 100 / tg))
+            bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
+            eta = max(0, tg - el)
+            lines.append(f"L{i + 1} {st['loc'][:38]:<38} {bar} {pct:3d}%  "
+                         f"{el // 60:02d}:{el % 60:02d}/{tg // 60:02d}:{tg % 60:02d}  剩{eta // 60}分")
+        if not lines:
+            lines = ["（未开始）"]
+        self.lane_box.configure(state="normal")
+        self.lane_box.delete("1.0", "end")
+        self.lane_box.insert("1.0", "\n".join(lines))
+        self.lane_box.configure(state="disabled")
 
     def _tick_mascot(self):
         """idle 动效：6 帧循环，运行中稍快一点（像在陪你干活）。"""
@@ -1504,7 +1581,7 @@ class WelearnApp:
         bottom_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         bottom_frame.pack(side="bottom", fill="x", padx=15, pady=(4, 10))
         ctk.CTkFrame(bottom_frame, height=1, fg_color=("#30363d", "#21262d")).pack(fill="x", pady=(0, 6))
-        ctk.CTkLabel(bottom_frame, text="v3.8 · 免费开源",
+        ctk.CTkLabel(bottom_frame, text="v3.9 · 免费开源",
                      font=ctk.CTkFont(size=9),
                      text_color=("#484f58", "#484f58")).pack(anchor="w")
 
@@ -1799,6 +1876,28 @@ class WelearnApp:
         self.task_stats_label = ctk.CTkLabel(progress_frame, text="", font=ctk.CTkFont(size=11),
                                               text_color=("#64748b", "#94a3b8"))
         self.task_stats_label.pack(anchor="w")
+
+        # 每路实时状态（最多 8 行）
+        self.lane_box = ctk.CTkTextbox(progress_frame, height=88, font=ctk.CTkFont(size=11),
+                                       fg_color=("#f8fafc", "#0b1220"),
+                                       text_color=("#334155", "#c9d6ea"),
+                                       border_width=1, border_color=("#e2e8f0", "#1b2740"))
+        self.lane_box.pack(fill="x", pady=(6, 0))
+        self.lane_box.configure(state="disabled")
+        self._lane_state = {}
+
+        # 单节上限
+        cap_row = ctk.CTkFrame(progress_frame, fg_color="transparent")
+        cap_row.pack(fill="x", pady=(6, 0))
+        ctk.CTkLabel(cap_row, text="单节上限:", font=ctk.CTkFont(size=11)).pack(side="left")
+        self.cap_menu = ctk.CTkOptionMenu(cap_row, values=["10 分钟", "15 分钟", "20 分钟", "30 分钟", "不设上限"],
+                                          width=110, height=26, font=ctk.CTkFont(size=11),
+                                          command=self._on_cap_change)
+        self.cap_menu.pack(side="left", padx=6)
+        _cap = int(getattr(self, "lesson_cap", 1200) or 0)
+        self.cap_menu.set(f"{_cap // 60} 分钟" if _cap else "不设上限")
+        ctk.CTkLabel(cap_row, text="（平台要求 30 分钟时，超限就下次再补，更像真人）",
+                     font=ctk.CTkFont(size=10), text_color=("#64748b", "#7c8db5")).pack(side="left")
 
         # 恢复上次使用的节奏预设
         saved_preset = (self._config or {}).get("preset")
@@ -2345,6 +2444,9 @@ class WelearnApp:
         self._log("─" * 55)
         self.stop_requested = False
         self.task_progress_bar.set(0)
+        if hasattr(self, "_lane_state"):
+            self._lane_state.clear()
+            self._render_lanes()
         self.task_stats_label.configure(text="")
 
         if mode == "curriculum":
@@ -2403,7 +2505,7 @@ class WelearnApp:
                 timeout=10)
             if resp.status_code == 200:
                 latest = resp.json()["tag_name"]
-                self._log(f"最新版本: {latest}，当前: v3.8")
+                self._log(f"最新版本: {latest}，当前: v3.9")
             else:
                 self._log("GitHub 仓库尚未设置，无法检查更新", "log_warning")
         except Exception:
@@ -2417,7 +2519,7 @@ class WelearnApp:
                   "settings": ("⚙️  设置", "⚙️  Settings")}
         for key, (zh, en) in labels.items():
             self.nav_buttons[key].configure(text=zh if self.lang == "zh" else en)
-        self.root.title("Welearn 刷课工具 v3.8" if self.lang == "zh" else "Welearn Tool v3.8")
+        self.root.title("Welearn 刷课工具 v3.9" if self.lang == "zh" else "Welearn Tool v3.9")
 
     def _show_disclaimer(self):
         dialog = ctk.CTkToplevel(self.root)
@@ -2434,7 +2536,7 @@ class WelearnApp:
 
         ctk.CTkLabel(dialog, text="Welearn 刷课工具",
                      font=ctk.CTkFont(size=20, weight="bold")).pack(pady=(25, 5))
-        ctk.CTkLabel(dialog, text="v3.8 · 免费开源", text_color="gray").pack(pady=(0, 20))
+        ctk.CTkLabel(dialog, text="v3.9 · 免费开源", text_color="gray").pack(pady=(0, 20))
         ctk.CTkFrame(dialog, height=1, fg_color="gray").pack(fill="x", padx=40, pady=(0, 15))
 
         ctk.CTkLabel(dialog, text="本软件完全免费，仅供学习交流使用。\n\n"
@@ -2500,6 +2602,13 @@ class WelearnApp:
             self.uid, self.classid, self.units = msg["uid"], msg["classid"], msg["units"]
             self._populate_unit_menu()
             self._log(f"获取单元成功，共 {len(self.units)} 个单元")
+        elif t == "lesson_progress":
+            self._lane_state[msg["lane"]] = {"loc": msg["loc"], "elapsed": msg["elapsed"],
+                                             "target": msg["target"]}
+            self._render_lanes()
+        elif t == "lane_done":
+            self._lane_state.pop(msg["lane"], None)
+            self._render_lanes()
         elif t == "progress":
             current, total = msg["current"], msg["total"]
             remaining = total - current
